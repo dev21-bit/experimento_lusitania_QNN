@@ -26,7 +26,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = True  # Mejor para rendimiento
+torch.backends.cudnn.benchmark = True
 
 # =========================
 # CONFIGURACIÓN
@@ -43,8 +43,8 @@ DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 KFOLDS      = 3
 MAX_SAMPLES = 2400
 BATCH_SIZE  = 64
-EPOCHS_PHASE1 = 20  # Aumentado
-EPOCHS_PHASE2 = 10  # Aumentado
+EPOCHS_PHASE1 = 20
+EPOCHS_PHASE2 = 10
 
 OUTPUT_DIR = Path("resultados_entrenamiento_optimizado")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -104,11 +104,11 @@ except Exception:
     print("Simulador: default.qubit")
 
 # =========================
-# CIRCUITO CUÁNTICO
+# CIRCUITO CUÁNTICO (CORREGIDO)
 # =========================
-@qml.qnode(dev, interface="torch", diff_method="backprop")
+@qml.qnode(dev, interface="torch", diff_method="parameter-shift")
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
-    # Data encoding con más rotaciones
+    # Data encoding
     for i in range(N_QUBITS):
         qml.RX(inputs[i], wires=i)
         qml.RY(inputs[i], wires=i)
@@ -123,7 +123,7 @@ def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
             qml.RZ(weights[idx + 2], wires=q)
             idx += 3
         
-        # Entanglement con conexiones alternadas
+        # Entanglement
         for q in range(0, N_QUBITS - 1, 2):
             qml.CNOT(wires=[q, q + 1])
         for q in range(1, N_QUBITS - 1, 2):
@@ -154,7 +154,7 @@ class QuantumLayer(nn.Module):
         return torch.tensor(np.array(results), dtype=torch.float32, device=x.device)
 
 # =========================
-# MODELO HÍBRIDO MEJORADO
+# MODELO HÍBRIDO
 # =========================
 class HybridModel(nn.Module):
     def __init__(self):
@@ -198,7 +198,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
     return accuracy_score(all_labels, all_preds)
 
 # =========================
-# ENTRENAMIENTO MEJORADO
+# ENTRENAMIENTO
 # =========================
 def train_two_phase(model, train_loader, val_loader, fold, device):
     criterion = nn.CrossEntropyLoss()
@@ -263,7 +263,10 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
             break
     
     # Cargar mejor modelo de fase 1
-    model.load_state_dict(torch.load(OUTPUT_DIR / f"best_model_fold{fold}_phase1.pt"))
+    try:
+        model.load_state_dict(torch.load(OUTPUT_DIR / f"best_model_fold{fold}_phase1.pt"))
+    except:
+        pass
     
     # -------- FASE 2 --------
     print("\n--- FASE 2 (fine-tuning cuántico) ---")
@@ -345,7 +348,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     history = train_two_phase(model, train_loader, val_loader, fold, device)
     all_histories.append(history)
     
-    # Evaluación final
     acc = evaluate(model, val_loader, device)
     
     model.eval()
@@ -367,9 +369,6 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     all_acc.append(acc)
     all_f1.append(f1)
 
-# =========================
-# RESULTADOS FINALES
-# =========================
 print("\n" + "="*50)
 print("RESULTADOS FINALES")
 print("="*50)
