@@ -21,8 +21,8 @@ N_QUBITS = 6
 N_LAYERS = 1
 N_CLASSES = 3
 
-MAX_SAMPLES = 400
-BATCH_SIZE = 32
+MAX_SAMPLES = 00
+BATCH_SIZE = 2000
 KFOLDS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
