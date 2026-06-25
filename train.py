@@ -32,15 +32,15 @@ torch.backends.cudnn.benchmark = False
 CSV_PATH   = "mental_state.csv"
 LABEL_COL  = "Label"
 
-N_QUBITS   = 10
-N_LAYERS   = 2
+N_QUBITS   = 12
+N_LAYERS   = 3
 N_CLASSES  = 3
 N_WEIGHTS  = N_QUBITS * 3 * N_LAYERS
 
 DEVICE      = "cpu"
 KFOLDS      = 3
 MAX_SAMPLES = 2400   # None = usar todos los datos disponibles
-BATCH_SIZE  = 32
+BATCH_SIZE  = 64
 
 OUTPUT_DIR = Path("resultados_entrenamiento")
 OUTPUT_DIR.mkdir(exist_ok=True)
