@@ -39,7 +39,7 @@ N_WEIGHTS  = N_QUBITS * 3 * N_LAYERS   # 3 rotaciones × N_QUBITS × N_LAYERS
 
 DEVICE      = "cpu"
 KFOLDS      = 3
-MAX_SAMPLES = 2700
+MAX_SAMPLES = 2479
 BATCH_SIZE  = 32
 
 OUTPUT_DIR = Path("resultados_entrenamiento")
