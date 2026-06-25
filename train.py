@@ -51,15 +51,14 @@ device = torch.device(DEVICE)
 # CARGA Y PREPARACIÓN
 # =========================
 print("Cargando datos...")
-df = pd.read_csv(CSV_PATH)
-
-df, _ = train_test_split(
-    df,
-    train_size=MAX_SAMPLES,
-    stratify=df[LABEL_COL],
-    random_state=SEED
-)
-
+if MAX_SAMPLES < len(df):
+    df, _ = train_test_split(
+        df,
+        train_size=MAX_SAMPLES,
+        stratify=df[LABEL_COL],
+        random_state=SEED
+    )
+# Si MAX_SAMPLES >= len(df), usamos todo el dataset directamente
 X     = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
 y_raw = df[LABEL_COL].values
 
