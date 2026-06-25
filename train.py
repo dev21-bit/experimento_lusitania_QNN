@@ -23,6 +23,8 @@ N_LAYERS = 1
 N_CLASSES = 3
 
 BATCH_SIZE = 32
+EPOCHS_CLASSIC = 8
+EPOCHS_FINE = 5
 KFOLDS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,11 +33,9 @@ print("Device:", device)
 print("GPUs:", torch.cuda.device_count())
 
 # =========================
-# DATA (FIXED ROBUSTO)
+# DATA
 # =========================
 df = pd.read_csv(CSV_PATH)
-
-# ✔ FIX: subsampling seguro
 df = df.sample(n=min(MAX_SAMPLES, len(df)), random_state=SEED)
 
 X = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
@@ -44,47 +44,52 @@ y = LabelEncoder().fit_transform(df[LABEL_COL])
 X = StandardScaler().fit_transform(X)
 X = PCA(n_components=N_QUBITS).fit_transform(X)
 
-# normalización angular
 X = 2*np.pi*(X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0) + 1e-8) - np.pi
 
-X_t = torch.tensor(X, dtype=torch.float32)
-y_t = torch.tensor(y, dtype=torch.long)
+X = torch.tensor(X, dtype=torch.float32)
+y = torch.tensor(y, dtype=torch.long)
 
 # =========================
-# PENNYLANE GPU DEVICE
+# QUANTUM DEVICE
 # =========================
 dev = qml.device("lightning.gpu", wires=N_QUBITS)
 
 @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
 def quantum_circuit(inputs, weights):
 
-    # encoding
     for i in range(N_QUBITS):
         qml.RY(inputs[i], wires=i)
 
-    # variational circuit
     for l in range(N_LAYERS):
         for i in range(N_QUBITS):
             qml.RX(weights[l, i, 0], wires=i)
             qml.RY(weights[l, i, 1], wires=i)
 
         for i in range(N_QUBITS - 1):
-            qml.CNOT(wires=[i, i + 1])
+            qml.CNOT(wires=[i, i+1])
 
-    # output observables
     return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
 
 # =========================
-# MODEL
+# MODEL HÍBRIDO
 # =========================
 class HybridModel(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # 🔥 parámetros cuánticos entrenables
         self.q_params = nn.Parameter(
             torch.randn(N_LAYERS, N_QUBITS, 2) * 0.1
         )
 
+        # 🔥 bloque clásico previo (feature learning)
+        self.pre_classifier = nn.Sequential(
+            nn.Linear(N_QUBITS, 32),
+            nn.ReLU(),
+            nn.Linear(32, N_QUBITS)
+        )
+
+        # 🔥 clasificador final
         self.classifier = nn.Sequential(
             nn.Linear(N_QUBITS, 64),
             nn.ReLU(),
@@ -93,42 +98,42 @@ class HybridModel(nn.Module):
             nn.Linear(32, N_CLASSES)
         )
 
-    def forward(self, x):
+    def quantum_layer(self, x):
 
-        # ✔ FIX: evitar listas incorrectas
-        q_out = torch.stack([
+        # ✔ FIX estable tensorizado
+        return torch.stack([
             torch.stack(quantum_circuit(x[i], self.q_params))
             for i in range(x.shape[0])
         ])
 
-        return self.classifier(q_out)
+    def forward(self, x):
+
+        x = self.pre_classifier(x)     # clásico
+        x = self.quantum_layer(x)      # cuántico
+        x = self.classifier(x)         # clásico final
+
+        return x
 
 # =========================
-# TRAIN
+# TRAIN STEP
 # =========================
-def train(model, loader):
-    model.to(device)
+def train_epoch(model, loader, opt, loss_fn):
+    model.train()
+    total = 0
 
-    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
-    loss_fn = nn.CrossEntropyLoss()
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
 
-    for epoch in range(10):
-        model.train()
-        total_loss = 0
+        opt.zero_grad()
+        out = model(xb)
+        loss = loss_fn(out, yb)
 
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
+        loss.backward()
+        opt.step()
 
-            opt.zero_grad()
-            out = model(xb)
-            loss = loss_fn(out, yb)
+        total += loss.item()
 
-            loss.backward()
-            opt.step()
-
-            total_loss += loss.item()
-
-        print(f"Epoch {epoch+1} | loss={total_loss:.4f}")
+    return total
 
 # =========================
 # EVAL
@@ -151,42 +156,66 @@ def evaluate(model, loader):
     )
 
 # =========================
-# K-FOLD
+# K-FOLD + FINE TUNING
 # =========================
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
 results = []
 
-for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
+for fold, (tr, va) in enumerate(skf.split(X, y)):
 
     print("\n====================")
     print(f"FOLD {fold}")
     print("====================")
 
     train_loader = DataLoader(
-        TensorDataset(X_t[tr], y_t[tr]),
+        TensorDataset(X[tr], y[tr]),
         batch_size=BATCH_SIZE,
         shuffle=True
     )
 
     val_loader = DataLoader(
-        TensorDataset(X_t[va], y_t[va]),
+        TensorDataset(X[va], y[va]),
         batch_size=BATCH_SIZE,
         shuffle=False
     )
 
-    model = HybridModel()
+    model = HybridModel().to(device)
 
-    train(model, train_loader)
+    # =========================
+    # FASE 1: ENTRENAMIENTO CLÁSICO
+    # =========================
+    print("Fase 1: clásico")
+
+    opt = torch.optim.Adam(
+        model.pre_classifier.parameters(),
+        lr=1e-3
+    )
+
+    loss_fn = nn.CrossEntropyLoss()
+
+    for epoch in range(EPOCHS_CLASSIC):
+        loss = train_epoch(model, train_loader, opt, loss_fn)
+        acc, f1 = evaluate(model, val_loader)
+        print(f"[Classic] epoch {epoch+1} loss={loss:.3f} acc={acc:.3f} f1={f1:.3f}")
+
+    # =========================
+    # FASE 2: FINE TUNING CUÁNTICO
+    # =========================
+    print("Fase 2: quantum fine-tuning")
+
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    for epoch in range(EPOCHS_FINE):
+        loss = train_epoch(model, train_loader, opt, loss_fn)
+        acc, f1 = evaluate(model, val_loader)
+        print(f"[Quantum FT] epoch {epoch+1} loss={loss:.3f} acc={acc:.3f} f1={f1:.3f}")
 
     acc, f1 = evaluate(model, val_loader)
-
-    print(f"Fold {fold} -> ACC={acc:.4f} F1={f1:.4f}")
-
     results.append((acc, f1))
 
 # =========================
-# FINAL
+# RESULTADO FINAL
 # =========================
 accs = [r[0] for r in results]
 f1s = [r[1] for r in results]
