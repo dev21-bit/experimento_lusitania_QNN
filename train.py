@@ -35,11 +35,11 @@ LABEL_COL  = "Label"
 N_QUBITS   = 10
 N_LAYERS   = 2
 N_CLASSES  = 3
-N_WEIGHTS  = N_QUBITS * 3 * N_LAYERS   # 3 rotaciones × N_QUBITS × N_LAYERS
+N_WEIGHTS  = N_QUBITS * 3 * N_LAYERS
 
 DEVICE      = "cpu"
 KFOLDS      = 3
-MAX_SAMPLES = len(def)
+MAX_SAMPLES = 2400   # None = usar todos los datos disponibles
 BATCH_SIZE  = 32
 
 OUTPUT_DIR = Path("resultados_entrenamiento")
@@ -51,21 +51,28 @@ device = torch.device(DEVICE)
 # CARGA Y PREPARACIÓN
 # =========================
 print("Cargando datos...")
-if MAX_SAMPLES < len(df):
+df = pd.read_csv(CSV_PATH)
+print(f"Total de muestras en CSV: {len(df)}")
+
+# Submuestreo opcional: solo si MAX_SAMPLES < total del dataset
+if MAX_SAMPLES is not None and MAX_SAMPLES < len(df):
     df, _ = train_test_split(
         df,
         train_size=MAX_SAMPLES,
         stratify=df[LABEL_COL],
         random_state=SEED
     )
-# Si MAX_SAMPLES >= len(df), usamos todo el dataset directamente
+    print(f"Submuestreo aplicado: usando {MAX_SAMPLES} muestras")
+else:
+    print(f"Usando todos los datos disponibles: {len(df)} muestras")
+
 X     = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
 y_raw = df[LABEL_COL].values
 
 label_encoder = LabelEncoder()
 y = label_encoder.fit_transform(y_raw)
 
-scaler  = StandardScaler()
+scaler   = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
 pca = PCA(n_components=N_QUBITS)
@@ -95,24 +102,12 @@ except Exception:
 # =========================
 # CIRCUITO CUÁNTICO
 # =========================
-# Se define con @qml.qnode para ser idiomático en PennyLane moderno.
-# interface="torch"  → los tensores de entrada/pesos son torch.Tensor
-# diff_method="best" → PennyLane elige el mejor método de diferenciación disponible
-#                      (parameter-shift si no hay adjoint, adjoint con lightning)
 @qml.qnode(dev, interface="torch", diff_method="best")
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
-    """
-    VQC equivalente al circuito de Qiskit original:
-      - Data encoding : RX + RY por qubit (angle embedding doble)
-      - N_LAYERS capas: RX+RY+RZ por qubit + entanglement ring CNOT
-      - Observables   : <Z_i> para i en [0, N_QUBITS)   → N_QUBITS salidas reales
-    """
-    # --- Codificación de datos ---
     for i in range(N_QUBITS):
         qml.RX(inputs[i], wires=i)
         qml.RY(inputs[i], wires=i)
 
-    # --- Capas variacionales ---
     idx = 0
     for _ in range(N_LAYERS):
         for q in range(N_QUBITS):
@@ -120,13 +115,10 @@ def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
             qml.RY(weights[idx + 1], wires=q)
             qml.RZ(weights[idx + 2], wires=q)
             idx += 3
-
-        # Entanglement ring (idéntico al cx ring de Qiskit)
         for q in range(N_QUBITS - 1):
             qml.CNOT(wires=[q, q + 1])
         qml.CNOT(wires=[N_QUBITS - 1, 0])
 
-    # PennyLane >= 0.38 devuelve tuple de tensores scalares al usar múltiples expval
     return tuple(qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS))
 
 
@@ -134,31 +126,18 @@ def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
 # CAPA CUÁNTICA COMO nn.Module
 # =========================
 class QuantumLayer(nn.Module):
-    """
-    Equivalente a TorchConnector(qnn) de Qiskit.
-
-    Los pesos del circuito son nn.Parameter para que Adam/SGD los actualice
-    automáticamente. El gradiente fluye a través de PennyLane vía autograd
-    de PyTorch (parameter-shift rule o adjoint differentiation).
-    """
     def __init__(self, n_weights: int):
         super().__init__()
-        # Inicialización pequeña → evita barren plateaus en el inicio
         init_w = torch.empty(n_weights).uniform_(-np.pi / 4, np.pi / 4)
         self.weights = nn.Parameter(init_w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # quantum_circuit devuelve tuple de N_QUBITS tensores scalar por muestra.
-        # torch.stack convierte esa tuple en un vector (N_QUBITS,).
-        # Procesamos muestra a muestra (batch loop); PennyLane no soporta
-        # vmap sobre QNodes en versión estable, así que el loop es necesario.
-        # PennyLane (default.qubit / lightning.qubit) devuelve float64.
-        # Lo casteamos a float32 para compatibilidad con las capas Linear de PyTorch.
+        # .float() necesario: PennyLane devuelve float64, Linear espera float32
         rows = [
             torch.stack(list(quantum_circuit(x[i], self.weights))).float()
             for i in range(x.shape[0])
         ]
-        return torch.stack(rows)   # → (batch, N_QUBITS), float32
+        return torch.stack(rows)
 
 
 # =========================
@@ -179,16 +158,13 @@ class HybridModel(nn.Module):
         )
 
     def freeze_quantum(self):
-        """Fase 1: congela los pesos cuánticos, solo entrena la parte clásica."""
         self.quantum.weights.requires_grad = False
 
     def unfreeze_quantum(self):
-        """Fase 2: descongela para fine-tuning completo."""
         self.quantum.weights.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q_out = self.quantum(x)        # (batch, N_QUBITS)
-        return self.classifier(q_out)  # (batch, N_CLASSES)
+        return self.classifier(self.quantum(x))
 
 
 # =========================
@@ -197,14 +173,12 @@ class HybridModel(nn.Module):
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     all_preds, all_labels = [], []
-
     with torch.no_grad():
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
             preds = torch.argmax(model(xb), dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(yb.cpu().numpy())
-
     return accuracy_score(all_labels, all_preds)
 
 
@@ -224,15 +198,13 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
     model = model.to(device)
 
     optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=0.001
+        filter(lambda p: p.requires_grad, model.parameters()), lr=0.001
     )
 
     for epoch in range(15):
         start = time.time()
         model.train()
         epoch_loss, num_batches = 0.0, 0
-
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
@@ -241,11 +213,9 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
             optimizer.step()
             epoch_loss += loss.item()
             num_batches += 1
-
         avg_loss = epoch_loss / num_batches
-        acc      = evaluate(model, val_loader, device)
-        t        = time.time() - start
-
+        acc = evaluate(model, val_loader, device)
+        t = time.time() - start
         history['phase1']['loss'].append(avg_loss)
         history['phase1']['acc'].append(acc)
         history['phase1']['time'].append(t)
@@ -254,14 +224,12 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
     # -------- FASE 2: Fine-tuning cuántico --------
     print("\n--- FASE 2 (fine-tuning cuántico) ---")
     model.unfreeze_quantum()
-
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
 
     for epoch in range(6):
         start = time.time()
         model.train()
         epoch_loss, num_batches = 0.0, 0
-
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
@@ -270,11 +238,9 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
             optimizer.step()
             epoch_loss += loss.item()
             num_batches += 1
-
         avg_loss = epoch_loss / num_batches
-        acc      = evaluate(model, val_loader, device)
-        t        = time.time() - start
-
+        acc = evaluate(model, val_loader, device)
+        t = time.time() - start
         history['phase2']['loss'].append(avg_loss)
         history['phase2']['acc'].append(acc)
         history['phase2']['time'].append(t)
@@ -289,10 +255,10 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
 print("\nIniciando validación cruzada...")
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
-all_acc, all_f1          = [], []
-all_histories            = []
-all_confusion_matrices   = []
-class_names              = label_encoder.classes_
+all_acc, all_f1        = [], []
+all_histories          = []
+all_confusion_matrices = []
+class_names            = label_encoder.classes_
 
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     print(f"\n{'='*50}")
@@ -303,15 +269,11 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     y_train, y_val = y_tensor[train_idx], y_tensor[val_idx]
 
     train_loader = DataLoader(
-        TensorDataset(X_train, y_train),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
+        TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True,
         generator=torch.Generator().manual_seed(SEED)
     )
     val_loader = DataLoader(
-        TensorDataset(X_val, y_val),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
+        TensorDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False,
         generator=torch.Generator().manual_seed(SEED)
     )
 
@@ -330,7 +292,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
             preds.extend(p.cpu().numpy())
             labels.extend(yb.numpy())
 
-    f1     = f1_score(labels, preds, average="macro")
+    f1      = f1_score(labels, preds, average="macro")
     cm_fold = confusion_matrix(labels, preds)
     all_confusion_matrices.append(cm_fold)
 
