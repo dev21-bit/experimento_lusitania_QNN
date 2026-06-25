@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, f1_score
 import pandas as pd
@@ -17,12 +17,12 @@ SEED = 42
 CSV_PATH = "mental_state.csv"
 LABEL_COL = "Label"
 
+MAX_SAMPLES = 2000
 N_QUBITS = 6
 N_LAYERS = 1
 N_CLASSES = 3
 
-MAX_SAMPLES = 00
-BATCH_SIZE = 2000
+BATCH_SIZE = 32
 KFOLDS = 3
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,16 +31,12 @@ print("Device:", device)
 print("GPUs:", torch.cuda.device_count())
 
 # =========================
-# DATA
+# DATA (FIXED ROBUSTO)
 # =========================
 df = pd.read_csv(CSV_PATH)
 
-df, _ = train_test_split(
-    df,
-    train_size=MAX_SAMPLES,
-    stratify=df[LABEL_COL],
-    random_state=SEED
-)
+# ✔ FIX: subsampling seguro
+df = df.sample(n=min(MAX_SAMPLES, len(df)), random_state=SEED)
 
 X = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
 y = LabelEncoder().fit_transform(df[LABEL_COL])
@@ -55,7 +51,7 @@ X_t = torch.tensor(X, dtype=torch.float32)
 y_t = torch.tensor(y, dtype=torch.long)
 
 # =========================
-# PENNYLANE DEVICE
+# PENNYLANE GPU DEVICE
 # =========================
 dev = qml.device("lightning.gpu", wires=N_QUBITS)
 
@@ -66,7 +62,7 @@ def quantum_circuit(inputs, weights):
     for i in range(N_QUBITS):
         qml.RY(inputs[i], wires=i)
 
-    # variational layers
+    # variational circuit
     for l in range(N_LAYERS):
         for i in range(N_QUBITS):
             qml.RX(weights[l, i, 0], wires=i)
@@ -75,11 +71,11 @@ def quantum_circuit(inputs, weights):
         for i in range(N_QUBITS - 1):
             qml.CNOT(wires=[i, i + 1])
 
-    # IMPORTANT: return tensor-friendly structure
+    # output observables
     return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
 
 # =========================
-# HYBRID MODEL (FIXED)
+# MODEL
 # =========================
 class HybridModel(nn.Module):
     def __init__(self):
@@ -98,7 +94,8 @@ class HybridModel(nn.Module):
         )
 
     def forward(self, x):
-        # 🔥 FIX: ensure tensor stacking
+
+        # ✔ FIX: evitar listas incorrectas
         q_out = torch.stack([
             torch.stack(quantum_circuit(x[i], self.q_params))
             for i in range(x.shape[0])
@@ -107,7 +104,7 @@ class HybridModel(nn.Module):
         return self.classifier(q_out)
 
 # =========================
-# TRAIN LOOP
+# TRAIN
 # =========================
 def train(model, loader):
     model.to(device)
@@ -134,7 +131,7 @@ def train(model, loader):
         print(f"Epoch {epoch+1} | loss={total_loss:.4f}")
 
 # =========================
-# EVALUATION
+# EVAL
 # =========================
 def evaluate(model, loader):
     model.eval()
@@ -163,7 +160,7 @@ results = []
 for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
 
     print("\n====================")
-    print("FOLD", fold)
+    print(f"FOLD {fold}")
     print("====================")
 
     train_loader = DataLoader(
@@ -184,12 +181,12 @@ for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
 
     acc, f1 = evaluate(model, val_loader)
 
-    print(f"Fold {fold} -> ACC: {acc:.4f} | F1: {f1:.4f}")
+    print(f"Fold {fold} -> ACC={acc:.4f} F1={f1:.4f}")
 
     results.append((acc, f1))
 
 # =========================
-# FINAL RESULTS
+# FINAL
 # =========================
 accs = [r[0] for r in results]
 f1s = [r[1] for r in results]
