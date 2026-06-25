@@ -1,4 +1,3 @@
-import os
 import numpy as np
 import torch
 from torch import nn
@@ -6,18 +5,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.decomposition import PCA
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score
 import pandas as pd
-import time
-from pathlib import Path
-import random
 
-from qiskit import QuantumCircuit
-from qiskit.circuit import ParameterVector
-from qiskit.quantum_info import SparsePauliOp
-from qiskit.primitives import StatevectorEstimator
-from qiskit_machine_learning.neural_networks import EstimatorQNN
-from qiskit_machine_learning.connectors import TorchConnector
+import pennylane as qml
 
 # =========================
 # CONFIG
@@ -26,38 +17,22 @@ SEED = 42
 CSV_PATH = "mental_state.csv"
 LABEL_COL = "Label"
 
-N_QUBITS = 6        # 🔥 reducido (clave performance)
-N_LAYERS = 1        # 🔥 reducido
+N_QUBITS = 6
+N_LAYERS = 1
 N_CLASSES = 3
 
 MAX_SAMPLES = 400
 BATCH_SIZE = 32
 KFOLDS = 3
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-OUTPUT_DIR = Path("resultados")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-# =========================
-# REPRODUCIBILIDAD
-# =========================
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
-
-device_count = torch.cuda.device_count()
-
-print(f"CUDA disponible: {torch.cuda.is_available()} | GPUs: {device_count}")
+print("Device:", device)
+print("GPUs:", torch.cuda.device_count())
 
 # =========================
 # DATA
 # =========================
-print("Cargando datos...")
 df = pd.read_csv(CSV_PATH)
 
 df, _ = train_test_split(
@@ -68,82 +43,49 @@ df, _ = train_test_split(
 )
 
 X = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
-y_raw = df[LABEL_COL].values
+y = LabelEncoder().fit_transform(df[LABEL_COL])
 
-label_encoder = LabelEncoder()
-y = label_encoder.fit_transform(y_raw)
+X = StandardScaler().fit_transform(X)
+X = PCA(n_components=N_QUBITS).fit_transform(X)
 
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+# normalize to angles
+X = 2*np.pi*(X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0) + 1e-8) - np.pi
 
-pca = PCA(n_components=N_QUBITS)
-X_reduced = pca.fit_transform(X_scaled)
-
-# normalización angular
-X_angles = 2 * np.pi * (
-    (X_reduced - X_reduced.min(axis=0)) /
-    (X_reduced.max(axis=0) - X_reduced.min(axis=0) + 1e-8)
-) - np.pi
-
-X_tensor = torch.tensor(X_angles, dtype=torch.float32)
-y_tensor = torch.tensor(y, dtype=torch.long)
-
-print("Dataset:", X_tensor.shape)
+X_t = torch.tensor(X, dtype=torch.float32)
+y_t = torch.tensor(y, dtype=torch.long)
 
 # =========================
-# CIRCUITO CUÁNTICO (OPTIMIZADO)
+# PENNYLANE GPU DEVICE
 # =========================
-def create_vqc(n_qubits):
-    x = ParameterVector("x", n_qubits)
-    theta = ParameterVector("θ", n_qubits * 3 * N_LAYERS)
+dev = qml.device("lightning.gpu", wires=N_QUBITS)
 
-    qc = QuantumCircuit(n_qubits)
-
+@qml.qnode(dev, interface="torch", diff_method="parameter-shift")
+def quantum_circuit(inputs, weights):
     # encoding
-    for i in range(n_qubits):
-        qc.ry(x[i], i)
+    for i in range(N_QUBITS):
+        qml.RY(inputs[i], wires=i)
 
-    idx = 0
-    for _ in range(N_LAYERS):
-        for q in range(n_qubits):
-            qc.rx(theta[idx], q)
-            qc.ry(theta[idx+1], q)
-            qc.rz(theta[idx+2], q)
-            idx += 3
+    # variational layers
+    for l in range(N_LAYERS):
+        for i in range(N_QUBITS):
+            qml.RX(weights[l, i, 0], wires=i)
+            qml.RY(weights[l, i, 1], wires=i)
 
-        # entanglement ligero (más barato que full ring)
-        for q in range(n_qubits - 1):
-            qc.cx(q, q + 1)
+        for i in range(N_QUBITS - 1):
+            qml.CNOT(wires=[i, i+1])
 
-    observables = [
-        SparsePauliOp("I"*i + "Z" + "I"*(n_qubits-i-1))
-        for i in range(n_qubits)
-    ]
-
-    return qc, x, theta, observables
-
-
-qc, input_params, weight_params, observables = create_vqc(N_QUBITS)
-
-estimator = StatevectorEstimator()
-
-qnn = EstimatorQNN(
-    circuit=qc,
-    observables=observables,
-    input_params=input_params,
-    weight_params=weight_params,
-    estimator=estimator
-)
-
-quantum_layer = TorchConnector(qnn)
+    return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
 
 # =========================
-# MODELO
+# HYBRID MODEL
 # =========================
 class HybridModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.quantum = quantum_layer
+        self.q_params = nn.Parameter(
+            torch.randn(N_LAYERS, N_QUBITS, 2) * 0.1
+        )
+
         self.classifier = nn.Sequential(
             nn.Linear(N_QUBITS, 64),
             nn.ReLU(),
@@ -152,119 +94,56 @@ class HybridModel(nn.Module):
             nn.Linear(32, N_CLASSES)
         )
 
-    def freeze_quantum(self):
-        for p in self.quantum.parameters():
-            p.requires_grad = False
-
-    def unfreeze_quantum(self):
-        for p in self.quantum.parameters():
-            p.requires_grad = True
-
     def forward(self, x):
-        x = self.quantum(x)
-        return self.classifier(x)
+        q_out = []
+
+        for i in range(x.shape[0]):
+            q_out.append(
+                quantum_circuit(x[i], self.q_params)
+            )
+
+        q_out = torch.stack(q_out)
+        return self.classifier(q_out)
 
 # =========================
-# UTILIDADES
+# TRAIN
 # =========================
-def evaluate(model, loader, device):
-    model.eval()
-    preds, labels = [], []
-
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            out = model(xb)
-            preds.extend(torch.argmax(out, dim=1).cpu().numpy())
-            labels.extend(yb.cpu().numpy())
-
-    return accuracy_score(labels, preds), f1_score(labels, preds, average="macro")
-
-# =========================
-# ENTRENAMIENTO
-# =========================
-def train_model(model, train_loader, val_loader, device, epochs=10):
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+def train(model, loader):
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+    loss_fn = nn.CrossEntropyLoss()
 
     model.to(device)
 
-    for epoch in range(epochs):
-        model.train()
+    for epoch in range(10):
         total_loss = 0
 
-        for xb, yb in train_loader:
+        for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
 
-            optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            opt.zero_grad()
+            out = model(xb)
+            loss = loss_fn(out, yb)
+
             loss.backward()
-            optimizer.step()
+            opt.step()
 
             total_loss += loss.item()
 
-        acc, f1 = evaluate(model, val_loader, device)
-        print(f"Epoch {epoch+1} | loss={total_loss:.4f} acc={acc:.4f} f1={f1:.4f}")
+        print(f"Epoch {epoch} loss {total_loss:.4f}")
 
 # =========================
-# K-FOLD PARALELO POR GPU
+# RUN
 # =========================
-def run_fold(fold_id, train_idx, val_idx, gpu_id=0):
+skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{gpu_id % device_count}")
-    else:
-        device = torch.device("cpu")
-
-    X_train, X_val = X_tensor[train_idx], X_tensor[val_idx]
-    y_train, y_val = y_tensor[train_idx], y_tensor[val_idx]
+for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
+    print("\nFOLD", fold)
 
     train_loader = DataLoader(
-        TensorDataset(X_train, y_train),
+        TensorDataset(X_t[tr], y_t[tr]),
         batch_size=BATCH_SIZE,
-        shuffle=True,
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        TensorDataset(X_val, y_val),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=True
+        shuffle=True
     )
 
     model = HybridModel()
-
-    print(f"\nFold {fold_id} en GPU {gpu_id}")
-    train_model(model, train_loader, val_loader, device)
-
-    acc, f1 = evaluate(model, val_loader, device)
-    return acc, f1
-
-# =========================
-# MAIN K-FOLD
-# =========================
-print("\nIniciando K-Fold...")
-
-skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
-
-results = []
-
-for i, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor)):
-
-    gpu_id = i % max(device_count, 1)
-
-    acc, f1 = run_fold(i, train_idx, val_idx, gpu_id)
-    results.append((acc, f1))
-
-# =========================
-# RESULTADOS
-# =========================
-accs = [r[0] for r in results]
-f1s = [r[1] for r in results]
-
-print("\n====================")
-print("RESULTADOS FINALES")
-print("====================")
-print(f"Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
-print(f"F1:       {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
+    train(model, train_loader)
