@@ -48,19 +48,20 @@ y = LabelEncoder().fit_transform(df[LABEL_COL])
 X = StandardScaler().fit_transform(X)
 X = PCA(n_components=N_QUBITS).fit_transform(X)
 
-# normalize to angles
+# normalización angular
 X = 2*np.pi*(X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0) + 1e-8) - np.pi
 
 X_t = torch.tensor(X, dtype=torch.float32)
 y_t = torch.tensor(y, dtype=torch.long)
 
 # =========================
-# PENNYLANE GPU DEVICE
+# PENNYLANE DEVICE
 # =========================
 dev = qml.device("lightning.gpu", wires=N_QUBITS)
 
 @qml.qnode(dev, interface="torch", diff_method="parameter-shift")
 def quantum_circuit(inputs, weights):
+
     # encoding
     for i in range(N_QUBITS):
         qml.RY(inputs[i], wires=i)
@@ -72,16 +73,18 @@ def quantum_circuit(inputs, weights):
             qml.RY(weights[l, i, 1], wires=i)
 
         for i in range(N_QUBITS - 1):
-            qml.CNOT(wires=[i, i+1])
+            qml.CNOT(wires=[i, i + 1])
 
+    # IMPORTANT: return tensor-friendly structure
     return [qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS)]
 
 # =========================
-# HYBRID MODEL
+# HYBRID MODEL (FIXED)
 # =========================
 class HybridModel(nn.Module):
     def __init__(self):
         super().__init__()
+
         self.q_params = nn.Parameter(
             torch.randn(N_LAYERS, N_QUBITS, 2) * 0.1
         )
@@ -95,26 +98,25 @@ class HybridModel(nn.Module):
         )
 
     def forward(self, x):
-        q_out = []
+        # 🔥 FIX: ensure tensor stacking
+        q_out = torch.stack([
+            torch.stack(quantum_circuit(x[i], self.q_params))
+            for i in range(x.shape[0])
+        ])
 
-        for i in range(x.shape[0]):
-            q_out.append(
-                quantum_circuit(x[i], self.q_params)
-            )
-
-        q_out = torch.stack(q_out)
         return self.classifier(q_out)
 
 # =========================
-# TRAIN
+# TRAIN LOOP
 # =========================
 def train(model, loader):
+    model.to(device)
+
     opt = torch.optim.Adam(model.parameters(), lr=3e-4)
     loss_fn = nn.CrossEntropyLoss()
 
-    model.to(device)
-
     for epoch in range(10):
+        model.train()
         total_loss = 0
 
         for xb, yb in loader:
@@ -129,15 +131,40 @@ def train(model, loader):
 
             total_loss += loss.item()
 
-        print(f"Epoch {epoch} loss {total_loss:.4f}")
+        print(f"Epoch {epoch+1} | loss={total_loss:.4f}")
 
 # =========================
-# RUN
+# EVALUATION
+# =========================
+def evaluate(model, loader):
+    model.eval()
+    preds, labels = [], []
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            out = model(xb)
+
+            preds.extend(torch.argmax(out, dim=1).cpu().numpy())
+            labels.extend(yb.numpy())
+
+    return (
+        accuracy_score(labels, preds),
+        f1_score(labels, preds, average="macro")
+    )
+
+# =========================
+# K-FOLD
 # =========================
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
+results = []
+
 for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
-    print("\nFOLD", fold)
+
+    print("\n====================")
+    print("FOLD", fold)
+    print("====================")
 
     train_loader = DataLoader(
         TensorDataset(X_t[tr], y_t[tr]),
@@ -145,5 +172,30 @@ for fold, (tr, va) in enumerate(skf.split(X_t, y_t)):
         shuffle=True
     )
 
+    val_loader = DataLoader(
+        TensorDataset(X_t[va], y_t[va]),
+        batch_size=BATCH_SIZE,
+        shuffle=False
+    )
+
     model = HybridModel()
+
     train(model, train_loader)
+
+    acc, f1 = evaluate(model, val_loader)
+
+    print(f"Fold {fold} -> ACC: {acc:.4f} | F1: {f1:.4f}")
+
+    results.append((acc, f1))
+
+# =========================
+# FINAL RESULTS
+# =========================
+accs = [r[0] for r in results]
+f1s = [r[1] for r in results]
+
+print("\n====================")
+print("RESULTADO FINAL")
+print("====================")
+print(f"Accuracy: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+print(f"F1:       {np.mean(f1s):.4f} ± {np.std(f1s):.4f}")
