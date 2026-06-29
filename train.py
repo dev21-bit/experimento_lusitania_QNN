@@ -12,13 +12,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 import random
+import copy
 import warnings
 warnings.filterwarnings('ignore')
 
 import pennylane as qml
 
 # =========================
-# FIJAR SEMILLAS
+# SEMILLAS
 # =========================
 SEED = 42
 random.seed(SEED)
@@ -26,27 +27,30 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False
 
 # =========================
 # CONFIGURACIÓN
 # =========================
-CSV_PATH   = "mental_state.csv"
-LABEL_COL  = "Label"
+CSV_PATH      = "mental_state.csv"
+LABEL_COL     = "Label"
 
-N_QUBITS   = 12
-N_LAYERS   = 3
-N_CLASSES  = 3
-N_WEIGHTS  = N_QUBITS * 3 * N_LAYERS
+N_QUBITS      = 12
+N_LAYERS      = 3
+N_CLASSES     = 3
+N_WEIGHTS     = N_QUBITS * 3 * N_LAYERS
 
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-KFOLDS      = 3
-MAX_SAMPLES = 2400
-BATCH_SIZE  = 64
-EPOCHS_PHASE1 = 20
-EPOCHS_PHASE2 = 10
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+KFOLDS        = 3
+MAX_SAMPLES   = None        # None = todos los datos
+BATCH_SIZE    = 64
+EPOCHS_P1     = 30          # más épocas fase clásica
+EPOCHS_P2     = 15          # más épocas fine-tuning
+PATIENCE_P1   = 7           # early stopping más paciente
+LR_P1         = 3e-3        # lr más alto para convergencia rápida
+LR_P2         = 5e-4        # lr moderado para fine-tuning
 
-OUTPUT_DIR = Path("resultados_entrenamiento_optimizado")
+OUTPUT_DIR = Path("resultados_v3")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 device = torch.device(DEVICE)
@@ -57,18 +61,11 @@ print(f"Dispositivo PyTorch: {device}")
 # =========================
 print("Cargando datos...")
 df = pd.read_csv(CSV_PATH)
-print(f"Total de muestras en CSV: {len(df)}")
+print(f"Total muestras CSV: {len(df)}")
 
 if MAX_SAMPLES is not None and MAX_SAMPLES < len(df):
-    df, _ = train_test_split(
-        df,
-        train_size=MAX_SAMPLES,
-        stratify=df[LABEL_COL],
-        random_state=SEED
-    )
-    print(f"Submuestreo aplicado: usando {MAX_SAMPLES} muestras")
-else:
-    print(f"Usando todos los datos disponibles: {len(df)} muestras")
+    df, _ = train_test_split(df, train_size=MAX_SAMPLES,
+                              stratify=df[LABEL_COL], random_state=SEED)
 
 X     = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
 y_raw = df[LABEL_COL].values
@@ -76,239 +73,334 @@ y_raw = df[LABEL_COL].values
 label_encoder = LabelEncoder()
 y = label_encoder.fit_transform(y_raw)
 
-scaler = StandardScaler()
+# ── Preprocesado mejorado ──────────────────────────────────────────────────
+# 1. StandardScaler antes de PCA (igual que antes)
+scaler   = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-pca = PCA(n_components=N_QUBITS)
+# 2. PCA con N_QUBITS componentes
+pca       = PCA(n_components=N_QUBITS, random_state=SEED)
 X_reduced = pca.fit_transform(X_scaled)
+print(f"Varianza explicada PCA ({N_QUBITS} comp): {pca.explained_variance_ratio_.sum():.4f}")
 
-min_val = X_reduced.min(axis=0)
-max_val = X_reduced.max(axis=0)
-X_angles = 2 * np.pi * (X_reduced - min_val) / (max_val - min_val + 1e-8) - np.pi
+# 3. Nuevo: StandardScaler SOBRE las componentes PCA
+#    Esto normaliza cada componente independientemente → mejor condicionamiento
+#    para las rotaciones del circuito cuántico.
+pca_scaler  = StandardScaler()
+X_norm      = pca_scaler.fit_transform(X_reduced)
+
+# 4. Escalar a [-π, π] con tanh suave en lugar de min-max duro
+#    tanh aplana outliers → los ángulos nunca saturan en ±π
+X_angles = np.tanh(X_norm) * np.pi    # ∈ (−π, π), sin clipping
 
 X_tensor = torch.tensor(X_angles, dtype=torch.float32)
 y_tensor = torch.tensor(y, dtype=torch.long)
 
-print(f"Dataset final: {X_tensor.shape}")
-print(f"Distribución de clases: {np.bincount(y)}")
-print(f"Varianza explicada por PCA: {pca.explained_variance_ratio_.sum():.4f}")
+print(f"Dataset final  : {X_tensor.shape}")
+print(f"Clases         : {np.bincount(y)}")
 
 # =========================
 # DISPOSITIVO CUÁNTICO
 # =========================
 try:
     dev = qml.device("lightning.qubit", wires=N_QUBITS)
-    print("Simulador: lightning.qubit (C++, rápido)")
+    print("Simulador: lightning.qubit")
 except Exception:
     dev = qml.device("default.qubit", wires=N_QUBITS)
     print("Simulador: default.qubit")
 
 # =========================
-# CIRCUITO CUÁNTICO (CORREGIDO)
+# CIRCUITO CUÁNTICO
 # =========================
-@qml.qnode(dev, interface="torch", diff_method="parameter-shift")
+# diff_method="adjoint" es el más rápido con lightning.qubit y mantiene
+# gradientes exactos (sin ruido de parameter-shift).
+# Fallback a "parameter-shift" si adjoint no está disponible.
+try:
+    _test_dev = qml.device("lightning.qubit", wires=2)
+    DIFF_METHOD = "adjoint"
+except Exception:
+    DIFF_METHOD = "parameter-shift"
+
+@qml.qnode(dev, interface="torch", diff_method=DIFF_METHOD)
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
-    # Data encoding
+    """
+    Mejoras sobre v2:
+    - Encoding: RX+RY+RZ (tripleta completa, más expresivo)
+    - Entanglement: brick-wall (pares alternados) + ring final
+      → más conectividad sin aumentar profundidad
+    - Observables: <Z_i> en todos los qubits (igual que antes)
+    """
+    # ── Data encoding ──
     for i in range(N_QUBITS):
         qml.RX(inputs[i], wires=i)
         qml.RY(inputs[i], wires=i)
         qml.RZ(inputs[i], wires=i)
-    
-    # Capas variacionales
+
+    # ── Capas variacionales ──
     idx = 0
-    for _ in range(N_LAYERS):
+    for layer in range(N_LAYERS):
+        # Rotaciones
         for q in range(N_QUBITS):
-            qml.RX(weights[idx], wires=q)
+            qml.RX(weights[idx],     wires=q)
             qml.RY(weights[idx + 1], wires=q)
             qml.RZ(weights[idx + 2], wires=q)
             idx += 3
-        
-        # Entanglement
-        for q in range(0, N_QUBITS - 1, 2):
-            qml.CNOT(wires=[q, q + 1])
-        for q in range(1, N_QUBITS - 1, 2):
-            qml.CNOT(wires=[q, q + 1])
+
+        # Brick-wall entanglement (alterna pares pares/impares por capa)
+        if layer % 2 == 0:
+            for q in range(0, N_QUBITS - 1, 2):
+                qml.CNOT(wires=[q, q + 1])
+        else:
+            for q in range(1, N_QUBITS - 1, 2):
+                qml.CNOT(wires=[q, q + 1])
+
+        # Ring CNOT en todas las capas para conectividad global
         qml.CNOT(wires=[N_QUBITS - 1, 0])
-    
+
     return tuple(qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS))
 
-# =========================
-# CAPA CUÁNTICA
-# =========================
-class QuantumLayer(nn.Module):
-    def __init__(self, n_weights: int):
-        super().__init__()
-        init_w = torch.empty(n_weights).uniform_(-np.pi/4, np.pi/4)
-        self.weights = nn.Parameter(init_w)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.shape[0]
-        x_np = x.detach().cpu().numpy()
-        weights_np = self.weights.detach().cpu().numpy()
-        
-        results = []
-        for i in range(batch_size):
-            result = quantum_circuit(x_np[i], weights_np)
-            results.append(result)
-        
-        return torch.tensor(np.array(results), dtype=torch.float32, device=x.device)
 
 # =========================
-# MODELO HÍBRIDO
+# CAPA CUÁNTICA — CON GRADIENTE CORRECTO
+# =========================
+class QuantumLayer(nn.Module):
+    """
+    FIX CRÍTICO respecto a v2:
+    v2 hacía .detach().cpu().numpy() → rompía el grafo de autograd →
+    la Fase 2 no entrenaba realmente los pesos cuánticos.
+
+    Aquí pasamos torch.Tensor directamente al QNode (interface="torch"),
+    y el stack final mantiene requires_grad=True.
+    """
+    def __init__(self, n_weights: int):
+        super().__init__()
+        init_w = torch.empty(n_weights).uniform_(-np.pi / 4, np.pi / 4)
+        self.weights = nn.Parameter(init_w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x debe estar en CPU para PennyLane (el simulador es CPU-only)
+        x_cpu = x.cpu()
+        w_cpu = self.weights.cpu() if self.weights.is_cuda else self.weights
+
+        rows = [
+            torch.stack(list(quantum_circuit(x_cpu[i], w_cpu))).float()
+            for i in range(x_cpu.shape[0])
+        ]
+        out = torch.stack(rows)          # (batch, N_QUBITS), float32, con grad
+        return out.to(x.device)          # devolver al device original
+
+
+# =========================
+# MODELO HÍBRIDO MEJORADO
 # =========================
 class HybridModel(nn.Module):
+    """
+    Mejoras en el clasificador clásico:
+    - BatchNorm1d antes de cada bloque lineal (estabiliza entrenamiento)
+    - Skip connection: proyecta la salida cuántica directamente a N_CLASSES
+      y la suma al logit final (residual quantum shortcut)
+    - GELU en vez de ReLU (mejor gradiente en zonas negativas)
+    """
     def __init__(self):
         super().__init__()
         self.quantum = QuantumLayer(N_WEIGHTS)
+
+        # Rama principal
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(N_QUBITS),
-            nn.Linear(N_QUBITS, 128),
-            nn.ReLU(),
+            nn.Linear(N_QUBITS, 256),
+            nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Linear(256, 128),
+            nn.GELU(),
             nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Linear(128, 64),
+            nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(32, N_CLASSES)
+            nn.Linear(64, N_CLASSES),
         )
-    
+
+        # Residual shortcut: quantum → logits directamente
+        self.shortcut = nn.Linear(N_QUBITS, N_CLASSES)
+
     def freeze_quantum(self):
         self.quantum.weights.requires_grad = False
-    
+
     def unfreeze_quantum(self):
         self.quantum.weights.requires_grad = True
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.quantum(x))
+        q_out  = self.quantum(x)                    # (B, N_QUBITS)
+        logits = self.classifier(q_out)             # (B, N_CLASSES)
+        skip   = self.shortcut(q_out.detach())      # (B, N_CLASSES) — no backprop por skip en fase 1
+        return logits + 0.1 * skip                  # mezcla suave
+
+
+# =========================
+# LABEL SMOOTHING LOSS
+# =========================
+class LabelSmoothingCE(nn.Module):
+    """CrossEntropy con label smoothing (ε=0.1) → mejora generalización."""
+    def __init__(self, smoothing: float = 0.1):
+        super().__init__()
+        self.smoothing = smoothing
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        n_cls   = logits.size(-1)
+        log_p   = torch.log_softmax(logits, dim=-1)
+        # Distribución suavizada
+        with torch.no_grad():
+            smooth_dist = torch.full_like(log_p, self.smoothing / (n_cls - 1))
+            smooth_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
+        return -(smooth_dist * log_p).sum(dim=-1).mean()
+
 
 # =========================
 # EVALUACIÓN
 # =========================
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
     model.eval()
-    all_preds, all_labels = [], []
+    preds_all, labels_all = [], []
     with torch.no_grad():
         for xb, yb in loader:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = torch.argmax(model(xb), dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(yb.cpu().numpy())
-    return accuracy_score(all_labels, all_preds)
+            xb = xb.to(dev)
+            p  = torch.argmax(model(xb), dim=1)
+            preds_all.extend(p.cpu().numpy())
+            labels_all.extend(yb.numpy())
+    return accuracy_score(labels_all, preds_all)
+
 
 # =========================
-# ENTRENAMIENTO
+# ENTRENAMIENTO DOS FASES
 # =========================
-def train_two_phase(model, train_loader, val_loader, fold, device):
-    criterion = nn.CrossEntropyLoss()
-    history = {
+def train_two_phase(model, train_loader, val_loader, fold, dev):
+    criterion = LabelSmoothingCE(smoothing=0.1)
+    history   = {
         'phase1': {'loss': [], 'acc': [], 'time': []},
-        'phase2': {'loss': [], 'acc': [], 'time': []}
+        'phase2': {'loss': [], 'acc': [], 'time': []},
     }
-    
-    # -------- FASE 1 --------
-    print("\n--- FASE 1 (entrenamiento clásico) ---")
+
+    # ──────────────────────────────────────────────
+    # FASE 1: solo parte clásica + shortcut
+    # ──────────────────────────────────────────────
+    print("\n--- FASE 1 (clásico) ---")
     model.freeze_quantum()
-    model = model.to(device)
-    
+    model = model.to(dev)
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=0.001, weight_decay=1e-4
+        lr=LR_P1, weight_decay=1e-4
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=3
+    # Cosine annealing: baja el lr suavemente hasta LR_P1/10
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS_P1, eta_min=LR_P1 / 10
     )
-    
-    best_acc = 0
-    patience_counter = 0
-    
-    for epoch in range(EPOCHS_PHASE1):
-        start = time.time()
+
+    best_acc   = 0.0
+    best_state = None
+    patience_c = 0
+
+    for epoch in range(EPOCHS_P1):
+        t0 = time.time()
         model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        
+        ep_loss, n_batch = 0.0, 0
+
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = epoch_loss / num_batches
-        acc = evaluate(model, val_loader, device)
-        scheduler.step(acc)
-        t = time.time() - start
-        
+            ep_loss += loss.item(); n_batch += 1
+
+        scheduler.step()
+        avg_loss = ep_loss / n_batch
+        acc      = evaluate(model, val_loader, dev)
+        t        = time.time() - t0
+
         history['phase1']['loss'].append(avg_loss)
         history['phase1']['acc'].append(acc)
         history['phase1']['time'].append(t)
-        
+
         if acc > best_acc:
-            best_acc = acc
-            patience_counter = 0
-            torch.save(model.state_dict(), OUTPUT_DIR / f"best_model_fold{fold}_phase1.pt")
+            best_acc   = acc
+            best_state = copy.deepcopy(model.state_dict())
+            patience_c = 0
         else:
-            patience_counter += 1
-        
-        print(f"[F1] Epoch {epoch+1:02d}/{EPOCHS_PHASE1} | Loss: {avg_loss:.4f} | Acc: {acc:.4f} | Best: {best_acc:.4f} | Time: {t:.2f}s")
-        
-        if patience_counter >= 5:
-            print(f"Early stopping en epoch {epoch+1}")
+            patience_c += 1
+
+        print(f"[F1] Epoch {epoch+1:02d}/{EPOCHS_P1} | Loss: {avg_loss:.4f} | "
+              f"Acc: {acc:.4f} | Best: {best_acc:.4f} | "
+              f"LR: {scheduler.get_last_lr()[0]:.5f} | Time: {t:.1f}s")
+
+        if patience_c >= PATIENCE_P1:
+            print(f"  Early stop en epoch {epoch+1}")
             break
-    
-    # Cargar mejor modelo de fase 1
-    try:
-        model.load_state_dict(torch.load(OUTPUT_DIR / f"best_model_fold{fold}_phase1.pt"))
-    except:
-        pass
-    
-    # -------- FASE 2 --------
+
+    # Restaurar mejor checkpoint fase 1
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    print(f"  → Mejor acc fase 1: {best_acc:.4f}")
+
+    # ──────────────────────────────────────────────
+    # FASE 2: fine-tuning completo (cuántico + clásico)
+    # ──────────────────────────────────────────────
     print("\n--- FASE 2 (fine-tuning cuántico) ---")
     model.unfreeze_quantum()
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=0.0001, weight_decay=1e-4
+
+    # lr diferenciado: pesos cuánticos aprenden más despacio
+    optimizer = torch.optim.AdamW([
+        {'params': model.quantum.parameters(),    'lr': LR_P2 * 0.1},
+        {'params': model.classifier.parameters(), 'lr': LR_P2},
+        {'params': model.shortcut.parameters(),   'lr': LR_P2},
+    ], weight_decay=1e-4)
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPOCHS_P2, eta_min=LR_P2 / 20
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=2
-    )
-    
-    for epoch in range(EPOCHS_PHASE2):
-        start = time.time()
+
+    best_acc_p2 = best_acc
+    best_state  = copy.deepcopy(model.state_dict())
+
+    for epoch in range(EPOCHS_P2):
+        t0 = time.time()
         model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        
+        ep_loss, n_batch = 0.0, 0
+
         for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
+            xb, yb = xb.to(dev), yb.to(dev)
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-        
-        avg_loss = epoch_loss / num_batches
-        acc = evaluate(model, val_loader, device)
-        scheduler.step(acc)
-        t = time.time() - start
-        
+            ep_loss += loss.item(); n_batch += 1
+
+        scheduler.step()
+        avg_loss = ep_loss / n_batch
+        acc      = evaluate(model, val_loader, dev)
+        t        = time.time() - t0
+
         history['phase2']['loss'].append(avg_loss)
         history['phase2']['acc'].append(acc)
         history['phase2']['time'].append(t)
-        
-        print(f"[F2] Epoch {epoch+1:02d}/{EPOCHS_PHASE2} | Loss: {avg_loss:.4f} | Acc: {acc:.4f} | Time: {t:.2f}s")
-    
+
+        if acc > best_acc_p2:
+            best_acc_p2 = acc
+            best_state  = copy.deepcopy(model.state_dict())
+
+        print(f"[F2] Epoch {epoch+1:02d}/{EPOCHS_P2} | Loss: {avg_loss:.4f} | "
+              f"Acc: {acc:.4f} | Best: {best_acc_p2:.4f} | Time: {t:.1f}s")
+
+    # Restaurar mejor checkpoint global
+    model.load_state_dict(best_state)
+    print(f"  → Mejor acc fase 2: {best_acc_p2:.4f}")
+
     return history
+
 
 # =========================
 # VALIDACIÓN CRUZADA
@@ -316,59 +408,56 @@ def train_two_phase(model, train_loader, val_loader, fold, device):
 print("\nIniciando validación cruzada...")
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
-all_acc, all_f1 = [], []
-all_histories = []
+all_acc, all_f1        = [], []
+all_histories          = []
 all_confusion_matrices = []
-class_names = label_encoder.classes_
+class_names            = label_encoder.classes_
 
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     print(f"\n{'='*50}")
     print(f"FOLD {fold}/{KFOLDS}")
     print(f"{'='*50}")
-    
+
     X_train, X_val = X_tensor[train_idx], X_tensor[val_idx]
     y_train, y_val = y_tensor[train_idx], y_tensor[val_idx]
-    
-    train_loader = DataLoader(
-        TensorDataset(X_train, y_train),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        pin_memory=True if device.type == 'cuda' else False,
-        generator=torch.Generator().manual_seed(SEED)
-    )
-    val_loader = DataLoader(
-        TensorDataset(X_val, y_val),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        pin_memory=True if device.type == 'cuda' else False,
-        generator=torch.Generator().manual_seed(SEED)
-    )
-    
-    model = HybridModel()
+
+    pin = device.type == 'cuda'
+    train_loader = DataLoader(TensorDataset(X_train, y_train),
+                              batch_size=BATCH_SIZE, shuffle=True,
+                              pin_memory=pin,
+                              generator=torch.Generator().manual_seed(SEED))
+    val_loader   = DataLoader(TensorDataset(X_val, y_val),
+                              batch_size=BATCH_SIZE, shuffle=False,
+                              pin_memory=pin)
+
+    model   = HybridModel()
     history = train_two_phase(model, train_loader, val_loader, fold, device)
     all_histories.append(history)
-    
+
     acc = evaluate(model, val_loader, device)
-    
+
     model.eval()
-    preds, labels = [], []
+    preds, labels_list = [], []
     with torch.no_grad():
         for xb, yb in val_loader:
             xb = xb.to(device)
-            p = torch.argmax(model(xb), dim=1)
+            p  = torch.argmax(model(xb), dim=1)
             preds.extend(p.cpu().numpy())
-            labels.extend(yb.numpy())
-    
-    f1 = f1_score(labels, preds, average="macro")
-    cm_fold = confusion_matrix(labels, preds)
+            labels_list.extend(yb.numpy())
+
+    f1      = f1_score(labels_list, preds, average="macro")
+    cm_fold = confusion_matrix(labels_list, preds)
     all_confusion_matrices.append(cm_fold)
-    
+
     print(f"\nFold {fold} — Accuracy: {acc:.4f} | F1: {f1:.4f}")
     print(f"Matriz de confusión:\n{cm_fold}")
-    
+
     all_acc.append(acc)
     all_f1.append(f1)
 
+# =========================
+# RESULTADOS FINALES
+# =========================
 print("\n" + "="*50)
 print("RESULTADOS FINALES")
 print("="*50)
@@ -380,7 +469,6 @@ print(f"F1 promedio       : {np.mean(all_f1):.4f} ± {np.std(all_f1):.4f}")
 # =========================
 print("\nGenerando gráficas...")
 
-# 1. Curvas de entrenamiento
 fig, axes = plt.subplots(KFOLDS, 2, figsize=(14, 4 * KFOLDS))
 fig.suptitle("Curvas de entrenamiento por fold", fontsize=14, fontweight="bold")
 
@@ -390,17 +478,18 @@ for fi, history in enumerate(all_histories):
     a1 = history['phase1']['acc'];  a2 = history['phase2']['acc']
     ep1 = list(range(1, len(l1) + 1))
     ep2 = list(range(len(l1) + 1, len(l1) + len(l2) + 1))
-    
-    ax_loss.plot(ep1, l1, 'b-o', ms=4, label="Fase 1")
-    ax_loss.plot(ep2, l2, 'r-s', ms=4, label="Fase 2")
+
+    ax_loss.plot(ep1, l1, 'b-o', ms=3, label="Fase 1")
+    ax_loss.plot(ep2, l2, 'r-s', ms=3, label="Fase 2")
     ax_loss.axvline(len(l1) + .5, color='gray', ls='--', alpha=.5)
     ax_loss.set_title(f"Fold {fi+1} — Loss")
     ax_loss.set_xlabel("Época"); ax_loss.set_ylabel("Loss")
     ax_loss.legend(); ax_loss.grid(alpha=.3)
-    
-    ax_acc.plot(ep1, a1, 'b-o', ms=4, label="Fase 1")
-    ax_acc.plot(ep2, a2, 'r-s', ms=4, label="Fase 2")
+
+    ax_acc.plot(ep1, a1, 'b-o', ms=3, label="Fase 1")
+    ax_acc.plot(ep2, a2, 'r-s', ms=3, label="Fase 2")
     ax_acc.axvline(len(a1) + .5, color='gray', ls='--', alpha=.5)
+    ax_acc.axhline(0.80, color='green', ls=':', alpha=.6, label="80% target")
     ax_acc.set_title(f"Fold {fi+1} — Accuracy")
     ax_acc.set_xlabel("Época"); ax_acc.set_ylabel("Accuracy")
     ax_acc.legend(); ax_acc.grid(alpha=.3)
@@ -408,34 +497,28 @@ for fi, history in enumerate(all_histories):
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "curvas_entrenamiento.png", dpi=150, bbox_inches="tight")
 plt.close()
-print(f"  → {OUTPUT_DIR}/curvas_entrenamiento.png")
 
-# 2. Matrices de confusión
 fig, axes = plt.subplots(1, KFOLDS, figsize=(6 * KFOLDS, 5))
-if KFOLDS == 1:
-    axes = [axes]
+if KFOLDS == 1: axes = [axes]
 fig.suptitle("Matrices de confusión por fold", fontsize=14, fontweight="bold")
-
 for fi, cm in enumerate(all_confusion_matrices):
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names, ax=axes[fi])
     axes[fi].set_title(f"Fold {fi+1}")
     axes[fi].set_xlabel("Predicho"); axes[fi].set_ylabel("Real")
-
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "matrices_confusion.png", dpi=150, bbox_inches="tight")
 plt.close()
-print(f"  → {OUTPUT_DIR}/matrices_confusion.png")
 
-# 3. Resumen métricas
 fig, ax = plt.subplots(figsize=(7, 4))
 x = np.arange(KFOLDS); w = 0.35
 b1 = ax.bar(x - w/2, all_acc, w, label="Accuracy", color="#4A3AE8", alpha=.85)
-b2 = ax.bar(x + w/2, all_f1,  w, label="F1 macro", color="#2E7D32", alpha=.85)
+b2 = ax.bar(x + w/2, all_f1,  w, label="F1 macro",  color="#2E7D32", alpha=.85)
 ax.axhline(np.mean(all_acc), color="#4A3AE8", ls='--', alpha=.5,
            label=f"Acc media {np.mean(all_acc):.3f}")
-ax.axhline(np.mean(all_f1), color="#2E7D32", ls='--', alpha=.5,
-           label=f"F1 media {np.mean(all_f1):.3f}")
+ax.axhline(np.mean(all_f1),  color="#2E7D32", ls='--', alpha=.5,
+           label=f"F1 media  {np.mean(all_f1):.3f}")
+ax.axhline(0.80, color='red', ls=':', alpha=.7, label="80% target")
 ax.set_xticks(x); ax.set_xticklabels([f"Fold {i+1}" for i in range(KFOLDS)])
 ax.set_ylim(0, 1.1); ax.set_ylabel("Score")
 ax.set_title("Accuracy y F1 macro por fold")
@@ -446,7 +529,5 @@ for b in list(b1) + list(b2):
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "metricas_por_fold.png", dpi=150, bbox_inches="tight")
 plt.close()
-print(f"  → {OUTPUT_DIR}/metricas_por_fold.png")
 
-print("\n✅ Entrenamiento completado!")
-print(f"Resultados guardados en: {OUTPUT_DIR}")
+print(f"\n✅ Listo. Resultados en: {OUTPUT_DIR}")
