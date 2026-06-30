@@ -18,9 +18,6 @@ warnings.filterwarnings('ignore')
 
 import pennylane as qml
 
-# =========================
-# SEMILLAS
-# =========================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -29,9 +26,6 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# =========================
-# CONFIGURACIÓN
-# =========================
 CSV_PATH      = "mental_state.csv"
 LABEL_COL     = "Label"
 
@@ -47,7 +41,7 @@ BATCH_SIZE    = 64
 EPOCHS_P1     = 30
 EPOCHS_P2     = 15
 PATIENCE_P1   = 8
-LR_P1         = 1e-3        # vuelto al rango que funcionaba en v2 (no 3e-3)
+LR_P1         = 1e-3
 LR_P2         = 3e-4
 
 OUTPUT_DIR = Path("resultados_v4")
@@ -56,9 +50,6 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 device = torch.device(DEVICE)
 print(f"Dispositivo PyTorch: {device}")
 
-# =========================
-# CARGA Y PREPARACIÓN
-# =========================
 print("Cargando datos...")
 df = pd.read_csv(CSV_PATH)
 print(f"Total muestras CSV: {len(df)}")
@@ -76,10 +67,6 @@ y_raw = df[LABEL_COL].values
 label_encoder = LabelEncoder()
 y = label_encoder.fit_transform(y_raw)
 
-# ── Preprocesado: VUELTO al de v2 (min-max), que es el que funcionaba ──────
-# v3 introdujo tanh(StandardScaler) que SATURA la señal y la aplana,
-# destruyendo justo la información que el circuito necesita para discriminar.
-# Min-max preserva la distribución relativa completa sin comprimir extremos.
 scaler   = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
@@ -97,9 +84,6 @@ y_tensor = torch.tensor(y, dtype=torch.long)
 print(f"Dataset final  : {X_tensor.shape}")
 print(f"Clases         : {np.bincount(y)}")
 
-# =========================
-# DISPOSITIVO CUÁNTICO
-# =========================
 try:
     dev = qml.device("lightning.qubit", wires=N_QUBITS)
     print("Simulador: lightning.qubit")
@@ -115,10 +99,6 @@ except Exception:
 
 @qml.qnode(dev, interface="torch", diff_method=DIFF_METHOD)
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
-    """
-    Circuito mantenido de v3 (la arquitectura del circuito en sí no era
-    el problema — RX+RY+RZ encoding + brick-wall entanglement es razonable).
-    """
     for i in range(N_QUBITS):
         qml.RX(inputs[i], wires=i)
         qml.RY(inputs[i], wires=i)
@@ -143,9 +123,6 @@ def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
     return tuple(qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS))
 
 
-# =========================
-# CAPA CUÁNTICA — gradiente correcto (este fix de v3 SÍ se mantiene)
-# =========================
 class QuantumLayer(nn.Module):
     def __init__(self, n_weights: int):
         super().__init__()
@@ -163,22 +140,7 @@ class QuantumLayer(nn.Module):
         return out.to(x.device)
 
 
-# =========================
-# MODELO HÍBRIDO — simplificado respecto a v3
-# =========================
 class HybridModel(nn.Module):
-    """
-    Cambios respecto a v3:
-    - SIN shortcut residual: añadía ruido no aprendido en fase 1 y
-      competía mal por gradiente en fase 2. Se elimina.
-    - SIN BatchNorm en cascada: con solo 12 valores de entrada, 3 capas
-      de BatchNorm normalizaban agresivamente y borraban la señal útil.
-      Se mantiene un único BatchNorm a la entrada (estabiliza sin destruir).
-    - Red más estrecha (64->32, como v2) en vez de 256->128->64:
-      con 12 floats de entrada, una red ancha solo overfittea/satura.
-    - Dropout más suave (0.2/0.1, como v2) en vez de (0.3/0.2/0.1).
-    - GELU se mantiene (mejora real, neutral en riesgo).
-    """
     def __init__(self):
         super().__init__()
         self.quantum    = QuantumLayer(N_WEIGHTS)
@@ -203,12 +165,7 @@ class HybridModel(nn.Module):
         return self.classifier(self.quantum(x))
 
 
-# =========================
-# LOSS — label smoothing más suave
-# =========================
 class LabelSmoothingCE(nn.Module):
-    """ε=0.05 en vez de 0.1 — v3 suavizaba demasiado para un problema
-    de solo 3 clases, lo que aplana el gradiente útil al inicio."""
     def __init__(self, smoothing: float = 0.05):
         super().__init__()
         self.smoothing = smoothing
@@ -222,9 +179,6 @@ class LabelSmoothingCE(nn.Module):
         return -(smooth_dist * log_p).sum(dim=-1).mean()
 
 
-# =========================
-# EVALUACIÓN
-# =========================
 def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
     model.eval()
     preds_all, labels_all = [], []
@@ -237,9 +191,6 @@ def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
     return accuracy_score(labels_all, preds_all)
 
 
-# =========================
-# ENTRENAMIENTO DOS FASES
-# =========================
 def train_two_phase(model, train_loader, val_loader, fold, dev):
     criterion = LabelSmoothingCE(smoothing=0.05)
     history = {
@@ -247,8 +198,7 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
         'phase2': {'loss': [], 'acc': [], 'time': []},
     }
 
-    # -------- FASE 1 --------
-    print("\n--- FASE 1 (clásico) ---")
+    print("\n--- FASE 1 (clasico) ---")
     model.freeze_quantum()
     model = model.to(dev)
 
@@ -300,13 +250,11 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    print(f"  → Mejor acc fase 1: {best_acc:.4f}")
+    print(f"  -> Mejor acc fase 1: {best_acc:.4f}")
 
-    # -------- FASE 2 --------
-    print("\n--- FASE 2 (fine-tuning cuántico) ---")
+    print("\n--- FASE 2 (fine-tuning cuantico) ---")
     model.unfreeze_quantum()
 
-    # lr diferenciado mantenido (es razonable), pero sin penalizar tanto
     optimizer = torch.optim.AdamW([
         {'params': model.quantum.parameters(),    'lr': LR_P2 * 0.3},
         {'params': model.classifier.parameters(), 'lr': LR_P2},
@@ -349,15 +297,12 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
               f"Acc: {acc:.4f} | Best: {best_acc_p2:.4f} | Time: {t:.1f}s")
 
     model.load_state_dict(best_state)
-    print(f"  → Mejor acc fase 2: {best_acc_p2:.4f}")
+    print(f"  -> Mejor acc fase 2: {best_acc_p2:.4f}")
 
     return history
 
 
-# =========================
-# VALIDACIÓN CRUZADA
-# =========================
-print("\nIniciando validación cruzada...")
+print("\nIniciando validacion cruzada...")
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
 all_acc, all_f1        = [], []
@@ -402,24 +347,18 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
     all_confusion_matrices.append(cm_fold)
 
     print(f"\nFold {fold} — Accuracy: {acc:.4f} | F1: {f1:.4f}")
-    print(f"Matriz de confusión:\n{cm_fold}")
+    print(f"Matriz de confusion:\n{cm_fold}")
 
     all_acc.append(acc)
     all_f1.append(f1)
 
-# =========================
-# RESULTADOS FINALES
-# =========================
 print("\n" + "="*50)
 print("RESULTADOS FINALES")
 print("="*50)
-print(f"Accuracy promedio : {np.mean(all_acc):.4f} ± {np.std(all_acc):.4f}")
-print(f"F1 promedio       : {np.mean(all_f1):.4f} ± {np.std(all_f1):.4f}")
+print(f"Accuracy promedio : {np.mean(all_acc):.4f} +/- {np.std(all_acc):.4f}")
+print(f"F1 promedio       : {np.mean(all_f1):.4f} +/- {np.std(all_f1):.4f}")
 
-# =========================
-# GRÁFICAS
-# =========================
-print("\nGenerando gráficas...")
+print("\nGenerando graficas...")
 
 fig, axes = plt.subplots(KFOLDS, 2, figsize=(14, 4 * KFOLDS))
 fig.suptitle("Curvas de entrenamiento por fold", fontsize=14, fontweight="bold")
@@ -435,7 +374,7 @@ for fi, history in enumerate(all_histories):
     ax_loss.plot(ep2, l2, 'r-s', ms=3, label="Fase 2")
     ax_loss.axvline(len(l1) + .5, color='gray', ls='--', alpha=.5)
     ax_loss.set_title(f"Fold {fi+1} — Loss")
-    ax_loss.set_xlabel("Época"); ax_loss.set_ylabel("Loss")
+    ax_loss.set_xlabel("Epoca"); ax_loss.set_ylabel("Loss")
     ax_loss.legend(); ax_loss.grid(alpha=.3)
 
     ax_acc.plot(ep1, a1, 'b-o', ms=3, label="Fase 1")
@@ -443,7 +382,7 @@ for fi, history in enumerate(all_histories):
     ax_acc.axvline(len(a1) + .5, color='gray', ls='--', alpha=.5)
     ax_acc.axhline(0.80, color='green', ls=':', alpha=.6, label="80% target")
     ax_acc.set_title(f"Fold {fi+1} — Accuracy")
-    ax_acc.set_xlabel("Época"); ax_acc.set_ylabel("Accuracy")
+    ax_acc.set_xlabel("Epoca"); ax_acc.set_ylabel("Accuracy")
     ax_acc.legend(); ax_acc.grid(alpha=.3)
 
 plt.tight_layout()
@@ -452,7 +391,7 @@ plt.close()
 
 fig, axes = plt.subplots(1, KFOLDS, figsize=(6 * KFOLDS, 5))
 if KFOLDS == 1: axes = [axes]
-fig.suptitle("Matrices de confusión por fold", fontsize=14, fontweight="bold")
+fig.suptitle("Matrices de confusion por fold", fontsize=14, fontweight="bold")
 for fi, cm in enumerate(all_confusion_matrices):
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names, ax=axes[fi])
@@ -482,4 +421,4 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "metricas_por_fold.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-print(f"\n✅ Listo. Resultados en: {OUTPUT_DIR}")
+print(f"\nListo. Resultados en: {OUTPUT_DIR}")
