@@ -42,15 +42,15 @@ N_WEIGHTS     = N_QUBITS * 3 * N_LAYERS
 
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 KFOLDS        = 3
-MAX_SAMPLES   = None        # None = todos los datos
+MAX_SAMPLES   = 2400
 BATCH_SIZE    = 64
-EPOCHS_P1     = 30          # más épocas fase clásica
-EPOCHS_P2     = 15          # más épocas fine-tuning
-PATIENCE_P1   = 7           # early stopping más paciente
-LR_P1         = 3e-3        # lr más alto para convergencia rápida
-LR_P2         = 5e-4        # lr moderado para fine-tuning
+EPOCHS_P1     = 30
+EPOCHS_P2     = 15
+PATIENCE_P1   = 8
+LR_P1         = 1e-3        # vuelto al rango que funcionaba en v2 (no 3e-3)
+LR_P2         = 3e-4
 
-OUTPUT_DIR = Path("resultados_v3")
+OUTPUT_DIR = Path("resultados_v4")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 device = torch.device(DEVICE)
@@ -66,6 +66,9 @@ print(f"Total muestras CSV: {len(df)}")
 if MAX_SAMPLES is not None and MAX_SAMPLES < len(df):
     df, _ = train_test_split(df, train_size=MAX_SAMPLES,
                               stratify=df[LABEL_COL], random_state=SEED)
+    print(f"Submuestreo: usando {MAX_SAMPLES} muestras")
+else:
+    print(f"Usando todos los datos: {len(df)} muestras")
 
 X     = df.drop(columns=[LABEL_COL]).values.astype(np.float32)
 y_raw = df[LABEL_COL].values
@@ -73,25 +76,20 @@ y_raw = df[LABEL_COL].values
 label_encoder = LabelEncoder()
 y = label_encoder.fit_transform(y_raw)
 
-# ── Preprocesado mejorado ──────────────────────────────────────────────────
-# 1. StandardScaler antes de PCA (igual que antes)
+# ── Preprocesado: VUELTO al de v2 (min-max), que es el que funcionaba ──────
+# v3 introdujo tanh(StandardScaler) que SATURA la señal y la aplana,
+# destruyendo justo la información que el circuito necesita para discriminar.
+# Min-max preserva la distribución relativa completa sin comprimir extremos.
 scaler   = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
-# 2. PCA con N_QUBITS componentes
 pca       = PCA(n_components=N_QUBITS, random_state=SEED)
 X_reduced = pca.fit_transform(X_scaled)
 print(f"Varianza explicada PCA ({N_QUBITS} comp): {pca.explained_variance_ratio_.sum():.4f}")
 
-# 3. Nuevo: StandardScaler SOBRE las componentes PCA
-#    Esto normaliza cada componente independientemente → mejor condicionamiento
-#    para las rotaciones del circuito cuántico.
-pca_scaler  = StandardScaler()
-X_norm      = pca_scaler.fit_transform(X_reduced)
-
-# 4. Escalar a [-π, π] con tanh suave en lugar de min-max duro
-#    tanh aplana outliers → los ángulos nunca saturan en ±π
-X_angles = np.tanh(X_norm) * np.pi    # ∈ (−π, π), sin clipping
+min_val  = X_reduced.min(axis=0)
+max_val  = X_reduced.max(axis=0)
+X_angles = 2 * np.pi * (X_reduced - min_val) / (max_val - min_val + 1e-8) - np.pi
 
 X_tensor = torch.tensor(X_angles, dtype=torch.float32)
 y_tensor = torch.tensor(y, dtype=torch.long)
@@ -109,12 +107,6 @@ except Exception:
     dev = qml.device("default.qubit", wires=N_QUBITS)
     print("Simulador: default.qubit")
 
-# =========================
-# CIRCUITO CUÁNTICO
-# =========================
-# diff_method="adjoint" es el más rápido con lightning.qubit y mantiene
-# gradientes exactos (sin ruido de parameter-shift).
-# Fallback a "parameter-shift" si adjoint no está disponible.
 try:
     _test_dev = qml.device("lightning.qubit", wires=2)
     DIFF_METHOD = "adjoint"
@@ -124,106 +116,82 @@ except Exception:
 @qml.qnode(dev, interface="torch", diff_method=DIFF_METHOD)
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
     """
-    Mejoras sobre v2:
-    - Encoding: RX+RY+RZ (tripleta completa, más expresivo)
-    - Entanglement: brick-wall (pares alternados) + ring final
-      → más conectividad sin aumentar profundidad
-    - Observables: <Z_i> en todos los qubits (igual que antes)
+    Circuito mantenido de v3 (la arquitectura del circuito en sí no era
+    el problema — RX+RY+RZ encoding + brick-wall entanglement es razonable).
     """
-    # ── Data encoding ──
     for i in range(N_QUBITS):
         qml.RX(inputs[i], wires=i)
         qml.RY(inputs[i], wires=i)
         qml.RZ(inputs[i], wires=i)
 
-    # ── Capas variacionales ──
     idx = 0
     for layer in range(N_LAYERS):
-        # Rotaciones
         for q in range(N_QUBITS):
             qml.RX(weights[idx],     wires=q)
             qml.RY(weights[idx + 1], wires=q)
             qml.RZ(weights[idx + 2], wires=q)
             idx += 3
 
-        # Brick-wall entanglement (alterna pares pares/impares por capa)
         if layer % 2 == 0:
             for q in range(0, N_QUBITS - 1, 2):
                 qml.CNOT(wires=[q, q + 1])
         else:
             for q in range(1, N_QUBITS - 1, 2):
                 qml.CNOT(wires=[q, q + 1])
-
-        # Ring CNOT en todas las capas para conectividad global
         qml.CNOT(wires=[N_QUBITS - 1, 0])
 
     return tuple(qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS))
 
 
 # =========================
-# CAPA CUÁNTICA — CON GRADIENTE CORRECTO
+# CAPA CUÁNTICA — gradiente correcto (este fix de v3 SÍ se mantiene)
 # =========================
 class QuantumLayer(nn.Module):
-    """
-    FIX CRÍTICO respecto a v2:
-    v2 hacía .detach().cpu().numpy() → rompía el grafo de autograd →
-    la Fase 2 no entrenaba realmente los pesos cuánticos.
-
-    Aquí pasamos torch.Tensor directamente al QNode (interface="torch"),
-    y el stack final mantiene requires_grad=True.
-    """
     def __init__(self, n_weights: int):
         super().__init__()
         init_w = torch.empty(n_weights).uniform_(-np.pi / 4, np.pi / 4)
         self.weights = nn.Parameter(init_w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x debe estar en CPU para PennyLane (el simulador es CPU-only)
         x_cpu = x.cpu()
         w_cpu = self.weights.cpu() if self.weights.is_cuda else self.weights
-
         rows = [
             torch.stack(list(quantum_circuit(x_cpu[i], w_cpu))).float()
             for i in range(x_cpu.shape[0])
         ]
-        out = torch.stack(rows)          # (batch, N_QUBITS), float32, con grad
-        return out.to(x.device)          # devolver al device original
+        out = torch.stack(rows)
+        return out.to(x.device)
 
 
 # =========================
-# MODELO HÍBRIDO MEJORADO
+# MODELO HÍBRIDO — simplificado respecto a v3
 # =========================
 class HybridModel(nn.Module):
     """
-    Mejoras en el clasificador clásico:
-    - BatchNorm1d antes de cada bloque lineal (estabiliza entrenamiento)
-    - Skip connection: proyecta la salida cuántica directamente a N_CLASSES
-      y la suma al logit final (residual quantum shortcut)
-    - GELU en vez de ReLU (mejor gradiente en zonas negativas)
+    Cambios respecto a v3:
+    - SIN shortcut residual: añadía ruido no aprendido en fase 1 y
+      competía mal por gradiente en fase 2. Se elimina.
+    - SIN BatchNorm en cascada: con solo 12 valores de entrada, 3 capas
+      de BatchNorm normalizaban agresivamente y borraban la señal útil.
+      Se mantiene un único BatchNorm a la entrada (estabiliza sin destruir).
+    - Red más estrecha (64->32, como v2) en vez de 256->128->64:
+      con 12 floats de entrada, una red ancha solo overfittea/satura.
+    - Dropout más suave (0.2/0.1, como v2) en vez de (0.3/0.2/0.1).
+    - GELU se mantiene (mejora real, neutral en riesgo).
     """
     def __init__(self):
         super().__init__()
-        self.quantum = QuantumLayer(N_WEIGHTS)
-
-        # Rama principal
+        self.quantum    = QuantumLayer(N_WEIGHTS)
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(N_QUBITS),
-            nn.Linear(N_QUBITS, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.BatchNorm1d(256),
-            nn.Linear(256, 128),
+            nn.Linear(N_QUBITS, 64),
             nn.GELU(),
             nn.Dropout(0.2),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, 64),
+            nn.Linear(64, 32),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(64, N_CLASSES),
+            nn.Linear(32, N_CLASSES),
         )
-
-        # Residual shortcut: quantum → logits directamente
-        self.shortcut = nn.Linear(N_QUBITS, N_CLASSES)
 
     def freeze_quantum(self):
         self.quantum.weights.requires_grad = False
@@ -232,25 +200,22 @@ class HybridModel(nn.Module):
         self.quantum.weights.requires_grad = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q_out  = self.quantum(x)                    # (B, N_QUBITS)
-        logits = self.classifier(q_out)             # (B, N_CLASSES)
-        skip   = self.shortcut(q_out.detach())      # (B, N_CLASSES) — no backprop por skip en fase 1
-        return logits + 0.1 * skip                  # mezcla suave
+        return self.classifier(self.quantum(x))
 
 
 # =========================
-# LABEL SMOOTHING LOSS
+# LOSS — label smoothing más suave
 # =========================
 class LabelSmoothingCE(nn.Module):
-    """CrossEntropy con label smoothing (ε=0.1) → mejora generalización."""
-    def __init__(self, smoothing: float = 0.1):
+    """ε=0.05 en vez de 0.1 — v3 suavizaba demasiado para un problema
+    de solo 3 clases, lo que aplana el gradiente útil al inicio."""
+    def __init__(self, smoothing: float = 0.05):
         super().__init__()
         self.smoothing = smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        n_cls   = logits.size(-1)
-        log_p   = torch.log_softmax(logits, dim=-1)
-        # Distribución suavizada
+        n_cls = logits.size(-1)
+        log_p = torch.log_softmax(logits, dim=-1)
         with torch.no_grad():
             smooth_dist = torch.full_like(log_p, self.smoothing / (n_cls - 1))
             smooth_dist.scatter_(1, targets.unsqueeze(1), 1.0 - self.smoothing)
@@ -276,15 +241,13 @@ def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
 # ENTRENAMIENTO DOS FASES
 # =========================
 def train_two_phase(model, train_loader, val_loader, fold, dev):
-    criterion = LabelSmoothingCE(smoothing=0.1)
-    history   = {
+    criterion = LabelSmoothingCE(smoothing=0.05)
+    history = {
         'phase1': {'loss': [], 'acc': [], 'time': []},
         'phase2': {'loss': [], 'acc': [], 'time': []},
     }
 
-    # ──────────────────────────────────────────────
-    # FASE 1: solo parte clásica + shortcut
-    # ──────────────────────────────────────────────
+    # -------- FASE 1 --------
     print("\n--- FASE 1 (clásico) ---")
     model.freeze_quantum()
     model = model.to(dev)
@@ -293,14 +256,11 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=LR_P1, weight_decay=1e-4
     )
-    # Cosine annealing: baja el lr suavemente hasta LR_P1/10
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS_P1, eta_min=LR_P1 / 10
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3
     )
 
-    best_acc   = 0.0
-    best_state = None
-    patience_c = 0
+    best_acc, best_state, patience_c = 0.0, None, 0
 
     for epoch in range(EPOCHS_P1):
         t0 = time.time()
@@ -316,9 +276,9 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
             optimizer.step()
             ep_loss += loss.item(); n_batch += 1
 
-        scheduler.step()
         avg_loss = ep_loss / n_batch
         acc      = evaluate(model, val_loader, dev)
+        scheduler.step(acc)
         t        = time.time() - t0
 
         history['phase1']['loss'].append(avg_loss)
@@ -326,40 +286,34 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
         history['phase1']['time'].append(t)
 
         if acc > best_acc:
-            best_acc   = acc
-            best_state = copy.deepcopy(model.state_dict())
-            patience_c = 0
+            best_acc, best_state, patience_c = acc, copy.deepcopy(model.state_dict()), 0
         else:
             patience_c += 1
 
+        cur_lr = optimizer.param_groups[0]['lr']
         print(f"[F1] Epoch {epoch+1:02d}/{EPOCHS_P1} | Loss: {avg_loss:.4f} | "
-              f"Acc: {acc:.4f} | Best: {best_acc:.4f} | "
-              f"LR: {scheduler.get_last_lr()[0]:.5f} | Time: {t:.1f}s")
+              f"Acc: {acc:.4f} | Best: {best_acc:.4f} | LR: {cur_lr:.5f} | Time: {t:.1f}s")
 
         if patience_c >= PATIENCE_P1:
             print(f"  Early stop en epoch {epoch+1}")
             break
 
-    # Restaurar mejor checkpoint fase 1
     if best_state is not None:
         model.load_state_dict(best_state)
     print(f"  → Mejor acc fase 1: {best_acc:.4f}")
 
-    # ──────────────────────────────────────────────
-    # FASE 2: fine-tuning completo (cuántico + clásico)
-    # ──────────────────────────────────────────────
+    # -------- FASE 2 --------
     print("\n--- FASE 2 (fine-tuning cuántico) ---")
     model.unfreeze_quantum()
 
-    # lr diferenciado: pesos cuánticos aprenden más despacio
+    # lr diferenciado mantenido (es razonable), pero sin penalizar tanto
     optimizer = torch.optim.AdamW([
-        {'params': model.quantum.parameters(),    'lr': LR_P2 * 0.1},
+        {'params': model.quantum.parameters(),    'lr': LR_P2 * 0.3},
         {'params': model.classifier.parameters(), 'lr': LR_P2},
-        {'params': model.shortcut.parameters(),   'lr': LR_P2},
     ], weight_decay=1e-4)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPOCHS_P2, eta_min=LR_P2 / 20
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=2
     )
 
     best_acc_p2 = best_acc
@@ -375,13 +329,13 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
             optimizer.zero_grad()
             loss = criterion(model(xb), yb)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             ep_loss += loss.item(); n_batch += 1
 
-        scheduler.step()
         avg_loss = ep_loss / n_batch
         acc      = evaluate(model, val_loader, dev)
+        scheduler.step(acc)
         t        = time.time() - t0
 
         history['phase2']['loss'].append(avg_loss)
@@ -389,13 +343,11 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
         history['phase2']['time'].append(t)
 
         if acc > best_acc_p2:
-            best_acc_p2 = acc
-            best_state  = copy.deepcopy(model.state_dict())
+            best_acc_p2, best_state = acc, copy.deepcopy(model.state_dict())
 
         print(f"[F2] Epoch {epoch+1:02d}/{EPOCHS_P2} | Loss: {avg_loss:.4f} | "
               f"Acc: {acc:.4f} | Best: {best_acc_p2:.4f} | Time: {t:.1f}s")
 
-    # Restaurar mejor checkpoint global
     model.load_state_dict(best_state)
     print(f"  → Mejor acc fase 2: {best_acc_p2:.4f}")
 
