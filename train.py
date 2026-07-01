@@ -44,7 +44,7 @@ PATIENCE_P1   = 8
 LR_P1         = 1e-3
 LR_P2         = 3e-4
 
-OUTPUT_DIR = Path("resultados_v4")
+OUTPUT_DIR = Path("resultados_v5")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 device = torch.device(DEVICE)
