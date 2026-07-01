@@ -51,7 +51,7 @@ torch.backends.cudnn.benchmark = False
 CSV_PATH      = "mental_state.csv"
 LABEL_COL     = "Label"
 
-N_QUBITS      = 12
+N_QUBITS      = 16
 N_LAYERS      = 3
 N_CLASSES     = 3
 N_WEIGHTS     = N_QUBITS * 3 * N_LAYERS
