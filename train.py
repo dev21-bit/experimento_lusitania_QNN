@@ -1,18 +1,52 @@
 # ============================================
-# CONFIGURACIÓN DE LOGGING EN TIEMPO REAL
+# CONFIGURACION DE LOGGING EN TIEMPO REAL
 # ============================================
 import sys
 import os
+import json
+from datetime import datetime
+import pickle
 
-# FORZAR SALIDA EN TIEMPO REAL - ¡CRÍTICO!
-sys.stdout.reconfigure(line_buffering=True)  # Python 3.7+
+# FORZAR SALIDA EN TIEMPO REAL
+sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 os.environ['PYTHONUNBUFFERED'] = '1'
 
-# Función de logging con timestamp
-def log(msg):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}", flush=True)
+# Crear carpeta para logs
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+CHECKPOINT_DIR = Path("checkpoints")
+CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+# Funcion de logging con timestamp y guardado en archivo
+def log(msg, also_print=True):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_msg = f"[{timestamp}] {msg}"
+    if also_print:
+        print(log_msg, flush=True)
+    
+    # Guardar en archivo de log
+    with open(LOG_DIR / "training_log.txt", "a") as f:
+        f.write(log_msg + "\n")
+
+# Guardar configuracion
+def save_config():
+    config = {
+        "N_QUBITS": N_QUBITS,
+        "N_LAYERS": N_LAYERS,
+        "KFOLDS": KFOLDS,
+        "EPOCHS_P1": EPOCHS_P1,
+        "EPOCHS_P2": EPOCHS_P2,
+        "LR_P1": LR_P1,
+        "LR_P2": LR_P2,
+        "BATCH_SIZE": BATCH_SIZE,
+        "MAX_SAMPLES": MAX_SAMPLES,
+        "SEED": SEED,
+        "timestamp": datetime.now().isoformat()
+    }
+    with open(OUTPUT_DIR / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    log("Configuracion guardada")
 
 # ============================================
 # IMPORTS
@@ -24,7 +58,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.decomposition import PCA
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
 import pandas as pd
 import time
 import matplotlib.pyplot as plt
@@ -38,7 +72,7 @@ warnings.filterwarnings('ignore')
 import pennylane as qml
 
 # ============================================
-# CONFIGURACIÓN
+# CONFIGURACION MEJORADA
 # ============================================
 SEED = 42
 random.seed(SEED)
@@ -51,8 +85,9 @@ torch.backends.cudnn.benchmark = False
 CSV_PATH      = "mental_state.csv"
 LABEL_COL     = "Label"
 
-N_QUBITS      = 16
-N_LAYERS      = 3
+# HIPERPARAMETROS OPTIMIZADOS
+N_QUBITS      = 14
+N_LAYERS      = 4
 N_CLASSES     = 3
 N_WEIGHTS     = N_QUBITS * 3 * N_LAYERS
 
@@ -60,16 +95,17 @@ DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 KFOLDS        = 3
 MAX_SAMPLES   = 2400
 BATCH_SIZE    = 64
-EPOCHS_P1     = 30
-EPOCHS_P2     = 15
-PATIENCE_P1   = 8
+EPOCHS_P1     = 35
+EPOCHS_P2     = 20
+PATIENCE_P1   = 10
 LR_P1         = 1e-3
-LR_P2         = 3e-4
+LR_P2         = 5e-4
 
-OUTPUT_DIR = Path("resultados_v5")
+OUTPUT_DIR = Path("resultados_v7")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 device = torch.device(DEVICE)
+log(f"Iniciando experimento v7")
 log(f"Dispositivo PyTorch: {device}")
 log(f"Output dir: {OUTPUT_DIR}")
 
@@ -107,7 +143,11 @@ pca = PCA(n_components=N_QUBITS, random_state=SEED)
 X_reduced = pca.fit_transform(X_scaled)
 log(f"Varianza explicada PCA: {pca.explained_variance_ratio_.sum():.4f}")
 
-log("Codificando ángulos...")
+# Guardar componentes PCA
+np.save(OUTPUT_DIR / "pca_components.npy", pca.components_)
+np.save(OUTPUT_DIR / "pca_mean.npy", pca.mean_)
+
+log("Codificando angulos...")
 min_val  = X_reduced.min(axis=0)
 max_val  = X_reduced.max(axis=0)
 X_angles = 2 * np.pi * (X_reduced - min_val) / (max_val - min_val + 1e-8) - np.pi
@@ -116,12 +156,18 @@ X_tensor = torch.tensor(X_angles, dtype=torch.float32)
 y_tensor = torch.tensor(y, dtype=torch.long)
 
 log(f"Dataset final: {X_tensor.shape}")
-log(f"Distribución de clases: {np.bincount(y)}")
+log(f"Distribucion de clases: {np.bincount(y)}")
+
+# Guardar estadisticas
+np.save(OUTPUT_DIR / "X_angles.npy", X_angles)
+np.save(OUTPUT_DIR / "y_labels.npy", y)
+
+save_config()
 
 # ============================================
-# CIRCUITO CUÁNTICO
+# CIRCUITO CUANTICO
 # ============================================
-log("Inicializando simulador cuántico...")
+log("Inicializando simulador cuantico...")
 try:
     dev = qml.device("lightning.qubit", wires=N_QUBITS)
     log("Simulador: lightning.qubit")
@@ -132,10 +178,10 @@ except Exception:
 try:
     _test_dev = qml.device("lightning.qubit", wires=2)
     DIFF_METHOD = "adjoint"
-    log("Método de diferenciación: adjoint")
+    log("Metodo de diferenciacion: adjoint")
 except Exception:
     DIFF_METHOD = "parameter-shift"
-    log("Método de diferenciación: parameter-shift")
+    log("Metodo de diferenciacion: parameter-shift")
 
 @qml.qnode(dev, interface="torch", diff_method=DIFF_METHOD)
 def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
@@ -163,7 +209,7 @@ def quantum_circuit(inputs: torch.Tensor, weights: torch.Tensor):
     return tuple(qml.expval(qml.PauliZ(i)) for i in range(N_QUBITS))
 
 # ============================================
-# MODELOS
+# MODELOS MEJORADOS
 # ============================================
 class QuantumLayer(nn.Module):
     def __init__(self, n_weights: int):
@@ -185,10 +231,14 @@ class QuantumLayer(nn.Module):
 class HybridModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.quantum    = QuantumLayer(N_WEIGHTS)
+        self.quantum = QuantumLayer(N_WEIGHTS)
+        # Clasificador mejorado con mas capacidad
         self.classifier = nn.Sequential(
             nn.BatchNorm1d(N_QUBITS),
-            nn.Linear(N_QUBITS, 64),
+            nn.Linear(N_QUBITS, 128),
+            nn.GELU(),
+            nn.Dropout(0.25),
+            nn.Linear(128, 64),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(64, 32),
@@ -208,7 +258,7 @@ class HybridModel(nn.Module):
 
 
 class LabelSmoothingCE(nn.Module):
-    def __init__(self, smoothing: float = 0.05):
+    def __init__(self, smoothing: float = 0.1):
         super().__init__()
         self.smoothing = smoothing
 
@@ -221,9 +271,9 @@ class LabelSmoothingCE(nn.Module):
         return -(smooth_dist * log_p).sum(dim=-1).mean()
 
 # ============================================
-# FUNCIONES DE ENTRENAMIENTO
+# FUNCIONES DE ENTRENAMIENTO MEJORADAS
 # ============================================
-def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
+def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> tuple:
     model.eval()
     preds_all, labels_all = [], []
     with torch.no_grad():
@@ -232,17 +282,21 @@ def evaluate(model: nn.Module, loader: DataLoader, dev: torch.device) -> float:
             p  = torch.argmax(model(xb), dim=1)
             preds_all.extend(p.cpu().numpy())
             labels_all.extend(yb.numpy())
-    return accuracy_score(labels_all, preds_all)
+    acc = accuracy_score(labels_all, preds_all)
+    f1 = f1_score(labels_all, preds_all, average="macro")
+    return acc, f1, labels_all, preds_all
 
 
 def train_two_phase(model, train_loader, val_loader, fold, dev):
-    criterion = LabelSmoothingCE(smoothing=0.05)
+    criterion = LabelSmoothingCE(smoothing=0.1)
     history = {
-        'phase1': {'loss': [], 'acc': [], 'time': []},
-        'phase2': {'loss': [], 'acc': [], 'time': []},
+        'phase1': {'loss': [], 'acc': [], 'f1': [], 'time': []},
+        'phase2': {'loss': [], 'acc': [], 'f1': [], 'time': []},
     }
 
-    log(f"\n--- FASE 1 (clásico) Fold {fold} ---")
+    log(f"\n{'='*60}")
+    log(f"--- FASE 1 (clasico) Fold {fold} ---")
+    log(f"{'='*60}")
     model.freeze_quantum()
     model = model.to(dev)
 
@@ -272,22 +326,27 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
             n_batch += 1
 
         avg_loss = ep_loss / n_batch
-        acc      = evaluate(model, val_loader, dev)
+        acc, f1, _, _ = evaluate(model, val_loader, dev)
         scheduler.step(acc)
-        t        = time.time() - t0
+        t = time.time() - t0
 
         history['phase1']['loss'].append(avg_loss)
         history['phase1']['acc'].append(acc)
+        history['phase1']['f1'].append(f1)
         history['phase1']['time'].append(t)
 
         if acc > best_acc:
             best_acc, best_state, patience_c = acc, copy.deepcopy(model.state_dict()), 0
+            # Guardar checkpoint del mejor modelo
+            torch.save(model.state_dict(), CHECKPOINT_DIR / f"best_phase1_fold{fold}.pt")
+            log(f"  Checkpoint guardado (acc: {best_acc:.4f})")
         else:
             patience_c += 1
 
         cur_lr = optimizer.param_groups[0]['lr']
-        log(f"[F1 Fold {fold}] Epoch {epoch+1:02d}/{EPOCHS_P1} | Loss: {avg_loss:.4f} | "
-            f"Acc: {acc:.4f} | Best: {best_acc:.4f} | LR: {cur_lr:.5f} | Time: {t:.1f}s")
+        log(f"[F1 Fold {fold}] Epoch {epoch+1:02d}/{EPOCHS_P1} | "
+            f"Loss: {avg_loss:.4f} | Acc: {acc:.4f} | F1: {f1:.4f} | "
+            f"Best: {best_acc:.4f} | LR: {cur_lr:.5f} | Time: {t:.1f}s")
 
         if patience_c >= PATIENCE_P1:
             log(f"  Early stop en epoch {epoch+1}")
@@ -295,9 +354,11 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    log(f"  -> Mejor acc fase 1: {best_acc:.4f}")
+    log(f"  Mejor acc fase 1: {best_acc:.4f}")
 
-    log(f"\n--- FASE 2 (fine-tuning cuántico) Fold {fold} ---")
+    log(f"\n{'='*60}")
+    log(f"--- FASE 2 (fine-tuning cuantico) Fold {fold} ---")
+    log(f"{'='*60}")
     model.unfreeze_quantum()
 
     optimizer = torch.optim.AdamW([
@@ -311,6 +372,7 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
 
     best_acc_p2 = best_acc
     best_state  = copy.deepcopy(model.state_dict())
+    best_f1 = 0.0
 
     for epoch in range(EPOCHS_P2):
         t0 = time.time()
@@ -328,43 +390,52 @@ def train_two_phase(model, train_loader, val_loader, fold, dev):
             n_batch += 1
 
         avg_loss = ep_loss / n_batch
-        acc      = evaluate(model, val_loader, dev)
+        acc, f1, _, _ = evaluate(model, val_loader, dev)
         scheduler.step(acc)
-        t        = time.time() - t0
+        t = time.time() - t0
 
         history['phase2']['loss'].append(avg_loss)
         history['phase2']['acc'].append(acc)
+        history['phase2']['f1'].append(f1)
         history['phase2']['time'].append(t)
 
         if acc > best_acc_p2:
-            best_acc_p2, best_state = acc, copy.deepcopy(model.state_dict())
+            best_acc_p2 = acc
+            best_state = copy.deepcopy(model.state_dict())
+            best_f1 = f1
+            torch.save(model.state_dict(), CHECKPOINT_DIR / f"best_phase2_fold{fold}.pt")
+            log(f"  Checkpoint guardado (acc: {best_acc_p2:.4f}, f1: {f1:.4f})")
 
-        log(f"[F2 Fold {fold}] Epoch {epoch+1:02d}/{EPOCHS_P2} | Loss: {avg_loss:.4f} | "
-            f"Acc: {acc:.4f} | Best: {best_acc_p2:.4f} | Time: {t:.1f}s")
+        log(f"[F2 Fold {fold}] Epoch {epoch+1:02d}/{EPOCHS_P2} | "
+            f"Loss: {avg_loss:.4f} | Acc: {acc:.4f} | F1: {f1:.4f} | "
+            f"Best: {best_acc_p2:.4f} | Time: {t:.1f}s")
 
     model.load_state_dict(best_state)
-    log(f"  -> Mejor acc fase 2: {best_acc_p2:.4f}")
+    log(f"  Mejor acc fase 2: {best_acc_p2:.4f} (F1: {best_f1:.4f})")
 
     return history
 
 # ============================================
-# VALIDACIÓN CRUZADA
+# VALIDACION CRUZADA
 # ============================================
-log("\n" + "="*50)
-log("Iniciando validación cruzada...")
-log("="*50)
+log(f"\n{'='*60}")
+log("INICIANDO VALIDACION CRUZADA")
+log(f"{'='*60}")
 
 skf = StratifiedKFold(n_splits=KFOLDS, shuffle=True, random_state=SEED)
 
-all_acc, all_f1        = [], []
-all_histories          = []
+all_acc, all_f1 = [], []
+all_histories = []
 all_confusion_matrices = []
-class_names            = label_encoder.classes_
+all_classification_reports = []
+class_names = label_encoder.classes_
+
+start_time = time.time()
 
 for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
-    log(f"\n{'='*50}")
+    log(f"\n{'='*60}")
     log(f"FOLD {fold}/{KFOLDS}")
-    log(f"{'='*50}")
+    log(f"{'='*60}")
 
     X_train, X_val = X_tensor[train_idx], X_tensor[val_idx]
     y_train, y_val = y_tensor[train_idx], y_tensor[val_idx]
@@ -376,53 +447,87 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X_tensor, y_tensor), 1):
                               batch_size=BATCH_SIZE, shuffle=True,
                               pin_memory=pin,
                               generator=torch.Generator().manual_seed(SEED))
-    val_loader   = DataLoader(TensorDataset(X_val, y_val),
-                              batch_size=BATCH_SIZE, shuffle=False,
-                              pin_memory=pin)
+    val_loader = DataLoader(TensorDataset(X_val, y_val),
+                            batch_size=BATCH_SIZE, shuffle=False,
+                            pin_memory=pin)
 
     model = HybridModel()
-    log(f"Modelo creado. Parámetros: {sum(p.numel() for p in model.parameters()):,}")
+    log(f"Modelo creado. Parametros: {sum(p.numel() for p in model.parameters()):,}")
 
     history = train_two_phase(model, train_loader, val_loader, fold, device)
     all_histories.append(history)
 
-    acc = evaluate(model, val_loader, device)
+    acc, f1, labels_list, preds = evaluate(model, val_loader, device)
 
-    model.eval()
-    preds, labels_list = [], []
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb = xb.to(device)
-            p  = torch.argmax(model(xb), dim=1)
-            preds.extend(p.cpu().numpy())
-            labels_list.extend(yb.numpy())
-
-    f1      = f1_score(labels_list, preds, average="macro")
     cm_fold = confusion_matrix(labels_list, preds)
     all_confusion_matrices.append(cm_fold)
 
-    log(f"\nFold {fold} — Accuracy: {acc:.4f} | F1: {f1:.4f}")
-    log(f"Matriz de confusión:\n{cm_fold}")
+    # Guardar classification report
+    report = classification_report(labels_list, preds, target_names=class_names, output_dict=True)
+    all_classification_reports.append(report)
+
+    log(f"\n{'='*50}")
+    log(f"RESULTADOS FOLD {fold}")
+    log(f"{'='*50}")
+    log(f"Accuracy: {acc:.4f} | F1: {f1:.4f}")
+    log(f"Matriz de confusion:\n{cm_fold}")
+
+    # Mostrar precision por clase
+    for cls in class_names:
+        idx = list(class_names).index(cls)
+        precision = report[cls]['precision']
+        recall = report[cls]['recall']
+        f1_score_cls = report[cls]['f1-score']
+        log(f"  {cls}: P={precision:.3f}, R={recall:.3f}, F1={f1_score_cls:.3f}")
 
     all_acc.append(acc)
     all_f1.append(f1)
 
+total_time = time.time() - start_time
+
 # ============================================
 # RESULTADOS FINALES
 # ============================================
-log("\n" + "="*50)
+log(f"\n{'='*60}")
 log("RESULTADOS FINALES")
-log("="*50)
+log(f"{'='*60}")
 log(f"Accuracy promedio : {np.mean(all_acc):.4f} +/- {np.std(all_acc):.4f}")
 log(f"F1 promedio       : {np.mean(all_f1):.4f} +/- {np.std(all_f1):.4f}")
+log(f"Tiempo total      : {total_time/60:.2f} minutos")
+log(f"Mejor accuracy    : {max(all_acc):.4f}")
+log(f"Peor accuracy     : {min(all_acc):.4f}")
+
+# Guardar resultados en JSON
+results = {
+    "accuracy": all_acc,
+    "f1": all_f1,
+    "mean_accuracy": np.mean(all_acc),
+    "std_accuracy": np.std(all_acc),
+    "mean_f1": np.mean(all_f1),
+    "std_f1": np.std(all_f1),
+    "best_accuracy": max(all_acc),
+    "total_time_minutes": total_time/60,
+    "config": {
+        "N_QUBITS": N_QUBITS,
+        "N_LAYERS": N_LAYERS,
+        "EPOCHS_P1": EPOCHS_P1,
+        "EPOCHS_P2": EPOCHS_P2,
+        "LR_P1": LR_P1,
+        "LR_P2": LR_P2,
+        "BATCH_SIZE": BATCH_SIZE
+    }
+}
+with open(OUTPUT_DIR / "results.json", "w") as f:
+    json.dump(results, f, indent=2)
 
 # ============================================
-# GRÁFICAS
+# GRAFICAS
 # ============================================
-log("\nGenerando gráficas...")
+log("\nGenerando graficas...")
 
+# 1. Curvas de entrenamiento
 fig, axes = plt.subplots(KFOLDS, 2, figsize=(14, 4 * KFOLDS))
-fig.suptitle("Curvas de entrenamiento por fold", fontsize=14, fontweight="bold")
+fig.suptitle(f"Curvas de entrenamiento por fold (v7)", fontsize=14, fontweight="bold")
 
 for fi, history in enumerate(all_histories):
     ax_loss, ax_acc = axes[fi]
@@ -435,7 +540,7 @@ for fi, history in enumerate(all_histories):
     ax_loss.plot(ep2, l2, 'r-s', ms=3, label="Fase 2")
     ax_loss.axvline(len(l1) + .5, color='gray', ls='--', alpha=.5)
     ax_loss.set_title(f"Fold {fi+1} — Loss")
-    ax_loss.set_xlabel("Época"); ax_loss.set_ylabel("Loss")
+    ax_loss.set_xlabel("Epoca"); ax_loss.set_ylabel("Loss")
     ax_loss.legend(); ax_loss.grid(alpha=.3)
 
     ax_acc.plot(ep1, a1, 'b-o', ms=3, label="Fase 1")
@@ -443,26 +548,29 @@ for fi, history in enumerate(all_histories):
     ax_acc.axvline(len(a1) + .5, color='gray', ls='--', alpha=.5)
     ax_acc.axhline(0.80, color='green', ls=':', alpha=.6, label="80% target")
     ax_acc.set_title(f"Fold {fi+1} — Accuracy")
-    ax_acc.set_xlabel("Época"); ax_acc.set_ylabel("Accuracy")
+    ax_acc.set_xlabel("Epoca"); ax_acc.set_ylabel("Accuracy")
     ax_acc.legend(); ax_acc.grid(alpha=.3)
 
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "curvas_entrenamiento.png", dpi=150, bbox_inches="tight")
 plt.close()
 
+# 2. Matrices de confusion
 fig, axes = plt.subplots(1, KFOLDS, figsize=(6 * KFOLDS, 5))
-if KFOLDS == 1: axes = [axes]
-fig.suptitle("Matrices de confusión por fold", fontsize=14, fontweight="bold")
+if KFOLDS == 1:
+    axes = [axes]
+fig.suptitle("Matrices de confusion por fold", fontsize=14, fontweight="bold")
 for fi, cm in enumerate(all_confusion_matrices):
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names, ax=axes[fi])
-    axes[fi].set_title(f"Fold {fi+1}")
+    axes[fi].set_title(f"Fold {fi+1} (Acc: {all_acc[fi]:.3f})")
     axes[fi].set_xlabel("Predicho"); axes[fi].set_ylabel("Real")
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "matrices_confusion.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-fig, ax = plt.subplots(figsize=(7, 4))
+# 3. Metricas por fold
+fig, ax = plt.subplots(figsize=(8, 5))
 x = np.arange(KFOLDS); w = 0.35
 b1 = ax.bar(x - w/2, all_acc, w, label="Accuracy", color="#4A3AE8", alpha=.85)
 b2 = ax.bar(x + w/2, all_f1,  w, label="F1 macro",  color="#2E7D32", alpha=.85)
@@ -482,7 +590,11 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "metricas_por_fold.png", dpi=150, bbox_inches="tight")
 plt.close()
 
-log(f"\n¡Listo! Resultados guardados en: {OUTPUT_DIR}")
+log(f"\nExperimento completado. Resultados en: {OUTPUT_DIR}")
 log("Archivos generados:")
 for f in OUTPUT_DIR.iterdir():
+    log(f"  - {f.name}")
+
+log("Checkpoints guardados:")
+for f in CHECKPOINT_DIR.iterdir():
     log(f"  - {f.name}")
