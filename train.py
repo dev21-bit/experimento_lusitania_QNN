@@ -1,6 +1,25 @@
 # ============================================
 # CONFIGURACION DE LOGGING EN TIEMPO REAL
 # ============================================
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.decomposition import PCA
+from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
+import pandas as pd
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import random
+import copy
+import warnings
+warnings.filterwarnings('ignore')
+
+import pennylane as qml
 import sys
 import os
 import json
@@ -51,25 +70,7 @@ def save_config():
 # ============================================
 # IMPORTS
 # ============================================
-import numpy as np
-import torch
-from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.decomposition import PCA
-from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
-import pandas as pd
-import time
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
-import random
-import copy
-import warnings
-warnings.filterwarnings('ignore')
 
-import pennylane as qml
 
 # ============================================
 # CONFIGURACION MEJORADA
